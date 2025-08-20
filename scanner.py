@@ -79,26 +79,36 @@ def moving_average(prices: pd.DataFrame, window: int) -> pd.DataFrame:
 
 def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int) -> dict:
     """
-    Detect whether a Golden or Death cross occurred within the last `lookback` rows.
+    Detect whether a Golden or Death cross occurred within the last `lookback` rows
+    for each ticker. Robust to missing data by aligning indexes first.
     Returns dict[ticker] -> "Golden" / "Death" / None
-    Robust to short history and NaNs.
     """
     res = {}
-    cols = [c for c in short_ma.columns if c in long_ma.columns]
-    for t in cols:
+    for t in short_ma.columns.intersection(long_ma.columns):
         s = short_ma[t].dropna()
         l = long_ma[t].dropna()
+
         if len(s) < 2 or len(l) < 2:
             res[t] = None
             continue
-        n = min(len(s), len(l))
-        s_recent = s.iloc[max(0, n - (lookback + 1)): ]
-        l_recent = l.iloc[max(0, n - (lookback + 1)): ]
+
+        # Align by datetime index to avoid "identically-labeled Series" errors
+        s_aligned, l_aligned = s.align(l, join="inner")
+        if s_aligned.empty or l_aligned.empty:
+            res[t] = None
+            continue
+
+        # Recent window = lookback+1 to compare today vs yesterday
+        window = max(2, int(lookback) + 1)
+        s_recent = s_aligned.tail(window)
+        l_recent = l_aligned.tail(window)
         if len(s_recent) < 2 or len(l_recent) < 2:
             res[t] = None
             continue
+
         cross_up = (s_recent > l_recent) & (s_recent.shift(1) <= l_recent.shift(1))
         cross_down = (s_recent < l_recent) & (s_recent.shift(1) >= l_recent.shift(1))
+
         if cross_up.any():
             res[t] = "Golden"
         elif cross_down.any():
@@ -163,7 +173,7 @@ if use_fundamentals:
 
 run = st.sidebar.button("Run Scan")
 
-# Keep these in outer scope so the sparkline expander can use them after a run
+# Keep these for sparkline use after a run
 prices = None
 
 # =========================
@@ -182,7 +192,7 @@ if run:
         ma200 = moving_average(prices, 200)
 
         # ---- Build latest snapshot safely (FIX) ----
-        # Forward-fill tiny holes so the last row is usable
+        # Forward-fill tiny gaps so the last row is usable
         prices_filled = prices.ffill()
         latest = pd.DataFrame({
             "Price": prices_filled.iloc[-1],
