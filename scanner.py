@@ -4,6 +4,9 @@ import numpy as np
 import yfinance as yf
 from io import BytesIO
 
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
 # =========================
 # Password protection (Streamlit Secrets)
 # =========================
@@ -16,7 +19,7 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
-    # If secrets missing, show a friendly message instead of KeyError
+    # Friendly message if secrets missing
     if "password" not in st.secrets or "app_password" not in st.secrets.get("password", {}):
         st.warning(
             "Password secret not set. In Streamlit Cloud go to **Settings → Secrets** and add:\n\n"
@@ -60,8 +63,7 @@ def download_prices(tickers, period="1y"):
         px = px["Close"]
     if isinstance(px, pd.Series):
         px = px.to_frame()
-    # drop columns completely empty (some symbols occasionally fail)
-    px = px.dropna(how="all", axis=1)
+    px = px.dropna(how="all", axis=1)  # drop totally empty tickers
     return px
 
 def rsi_wilder(prices: pd.DataFrame, period: int = 14) -> pd.DataFrame:
@@ -79,36 +81,29 @@ def moving_average(prices: pd.DataFrame, window: int) -> pd.DataFrame:
 
 def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int) -> dict:
     """
-    Detect whether a Golden or Death cross occurred within the last `lookback` rows
-    for each ticker. Robust to missing data by aligning indexes first.
+    Detect whether a Golden or Death cross occurred within last `lookback` rows.
+    Robust to missing data by aligning indexes first.
     Returns dict[ticker] -> "Golden" / "Death" / None
     """
     res = {}
     for t in short_ma.columns.intersection(long_ma.columns):
         s = short_ma[t].dropna()
         l = long_ma[t].dropna()
-
         if len(s) < 2 or len(l) < 2:
             res[t] = None
             continue
-
-        # Align by datetime index to avoid "identically-labeled Series" errors
         s_aligned, l_aligned = s.align(l, join="inner")
         if s_aligned.empty or l_aligned.empty:
             res[t] = None
             continue
-
-        # Recent window = lookback+1 to compare today vs yesterday
         window = max(2, int(lookback) + 1)
         s_recent = s_aligned.tail(window)
         l_recent = l_aligned.tail(window)
         if len(s_recent) < 2 or len(l_recent) < 2:
             res[t] = None
             continue
-
         cross_up = (s_recent > l_recent) & (s_recent.shift(1) <= l_recent.shift(1))
         cross_down = (s_recent < l_recent) & (s_recent.shift(1) >= l_recent.shift(1))
-
         if cross_up.any():
             res[t] = "Golden"
         elif cross_down.any():
@@ -116,6 +111,14 @@ def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int)
         else:
             res[t] = None
     return res
+
+def macd(prices: pd.DataFrame, fast=12, slow=26, signal=9):
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 def billions(x):
     if pd.isna(x):
@@ -125,7 +128,7 @@ def billions(x):
 @st.cache_data(show_spinner=False)
 def fetch_fundamentals(tickers):
     """
-    Fetch a small set of fundamentals using yfinance.
+    Fetch fundamentals using yfinance.
     Returns DataFrame indexed by ticker with columns:
     MarketCap (USD), PE (trailingPE), DividendYield (%), Beta
     """
@@ -163,6 +166,18 @@ if cross_filter_on:
     cross_type = st.sidebar.selectbox("Crossover Type", ["Golden", "Death"], index=0)
     cross_lookback = st.sidebar.number_input("Lookback days for crossover", min_value=1, max_value=60, value=20, step=1)
 
+# MACD controls
+st.sidebar.subheader("MACD")
+macd_on = st.sidebar.checkbox("Enable MACD filter", value=False)
+if macd_on:
+    macd_mode = st.sidebar.selectbox(
+        "MACD condition",
+        ["Line > Signal", "Histogram > 0", "Recent Bullish Cross (cross up)"],
+        index=0
+    )
+    macd_lookback = st.sidebar.number_input("Lookback days for MACD cross", 1, 60, 10, 1)
+
+# Fundamentals
 st.sidebar.subheader("Fundamental Filters")
 use_fundamentals = st.sidebar.checkbox("Enable fundamental filters", value=False, help="Fetching fundamentals may add 10–30 seconds.")
 if use_fundamentals:
@@ -173,8 +188,9 @@ if use_fundamentals:
 
 run = st.sidebar.button("Run Scan")
 
-# Keep these for sparkline use after a run
+# Keep prices for charting later
 prices = None
+macd_line = macd_signal = macd_hist = None
 
 # =========================
 # Main Scan
@@ -190,10 +206,10 @@ if run:
         rsi14 = rsi_wilder(prices, period=14)
         ma50 = moving_average(prices, 50)
         ma200 = moving_average(prices, 200)
+        macd_line, macd_signal, macd_hist = macd(prices)
 
-        # ---- Build latest snapshot safely (FIX) ----
-        # Forward-fill tiny gaps so the last row is usable
-        prices_filled = prices.ffill()
+        # ---- Latest snapshot (safe) ----
+        prices_filled = prices.ffill()  # tiny gaps filled
         latest = pd.DataFrame({
             "Price": prices_filled.iloc[-1],
             "RSI14": rsi14.iloc[-1],
@@ -201,74 +217,102 @@ if run:
             "MA200": ma200.iloc[-1],
         }).dropna()
 
-        # Technical filters
+        # ---- Technical filters ----
         filt = latest["RSI14"].between(rsi_min, rsi_max)
 
         if price_vs_ma50 != "Any":
-            if price_vs_ma50 == "Above":
-                filt &= latest["Price"] > latest["MA50"]
-            else:
-                filt &= latest["Price"] < latest["MA50"]
+            filt &= (latest["Price"] > latest["MA50"]) if price_vs_ma50 == "Above" else (latest["Price"] < latest["MA50"])
 
         if price_vs_ma200 != "Any":
-            if price_vs_ma200 == "Above":
-                filt &= latest["Price"] > latest["MA200"]
-            else:
-                filt &= latest["Price"] < latest["MA200"]
+            filt &= (latest["Price"] > latest["MA200"]) if price_vs_ma200 == "Above" else (latest["Price"] < latest["MA200"])
 
         if cross_filter_on:
             crosses = recent_crosses(ma50, ma200, lookback=int(cross_lookback))
             cross_mask = latest.index.to_series().map(lambda t: crosses.get(t) == cross_type)
             filt &= cross_mask.fillna(False)
 
+        if macd_on:
+            if macd_mode == "Line > Signal":
+                macd_mask = (macd_line.iloc[-1] > macd_signal.iloc[-1])
+            elif macd_mode == "Histogram > 0":
+                macd_mask = (macd_hist.iloc[-1] > 0)
+            else:
+                cross = (macd_line > macd_signal) & (macd_line.shift(1) <= macd_signal.shift(1))
+                macd_mask = cross.tail(int(macd_lookback)).any(axis=0)
+            macd_mask = macd_mask.reindex(latest.index).fillna(False)
+            filt &= macd_mask
+
         results = latest[filt].sort_index()
 
-    # Fundamentals (optional)
+    # ---- Fundamentals (optional) ----
     if use_fundamentals and len(results) > 0:
         with st.spinner("Fetching fundamentals (market cap, P/E, dividend yield, beta)..."):
             fundamentals_df = fetch_fundamentals(results.index.tolist())
             fund_mask = pd.Series(True, index=fundamentals_df.index)
-
             mc_b = fundamentals_df["MarketCap"].map(billions)
             fund_mask &= mc_b.between(cap_min_b, cap_max_b)
-
-            pe_ok = fundamentals_df["PE"].between(pe_min, pe_max).fillna(False)
-            fund_mask &= pe_ok
-
-            dy_ok = fundamentals_df["DividendYield"].fillna(0.0) >= dy_min
-            fund_mask &= dy_ok
-
-            beta_ok = fundamentals_df["Beta"].between(beta_min, beta_max).fillna(False)
-            fund_mask &= beta_ok
-
+            fund_mask &= fundamentals_df["PE"].between(pe_min, pe_max).fillna(False)
+            fund_mask &= fundamentals_df["DividendYield"].fillna(0.0) >= dy_min
+            fund_mask &= fundamentals_df["Beta"].between(beta_min, beta_max).fillna(False)
             results = results.join(fundamentals_df[fund_mask], how="inner")
 
-    # Display
+    # ---- Scoring (simple composite) ----
+    def z(x):  # z-score helper
+        return (x - x.mean()) / (x.std(ddof=0) + 1e-9)
+
+    if len(results) > 0:
+        rsi_sweet = - (results["RSI14"] - 50).abs()
+        trend_pts = (results["Price"] > results["MA50"]).astype(int) + (results["Price"] > results["MA200"]).astype(int)
+        macd_boost = pd.Series(0.0, indexresults:=results.index)  # fallback
+        try:
+            macd_boost = macd_hist.iloc[-1].reindex(results.index).fillna(0.0)
+        except Exception:
+            pass
+        results["Score"] = z(rsi_sweet) + z(trend_pts) + z(macd_boost)
+        results = results.sort_values("Score", ascending=False)
+
+    # ---- Display ----
     st.success(f"Found {len(results)} match(es).")
     if len(results) == 0:
-        st.info("No matches. Loosen filters and try again (e.g., wider RSI, MA = Any, longer crossover lookback).")
+        st.info("No matches. Loosen filters and try again (wider RSI, MA = Any, longer lookbacks).")
     else:
-        # Pretty market cap column if present
         if "MarketCap" in results.columns:
             results = results.copy()
             results["MarketCap ($B)"] = results["MarketCap"].map(billions).round(2)
-            first_cols = ["Price", "RSI14", "MA50", "MA200"]
-            extra = [c for c in ["MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in results.columns]
-            results = results[first_cols + extra]
-
+            first_cols = ["Score", "Price", "RSI14", "MA50", "MA200"]
+            extras = [c for c in ["MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in results.columns]
+            results = results[first_cols + extras]
         st.dataframe(results, use_container_width=True)
 
-        # Sparkline
-        with st.expander("Show mini price chart (sparkline) for a ticker"):
+        # ---- Full interactive chart (candles + MAs + MACD) ----
+        with st.expander("Open full interactive chart"):
             sel = st.selectbox("Choose ticker", results.index.tolist())
             if sel:
-                hist = prices[[sel]].dropna().tail(180) if prices is not None else None
-                if hist is not None and not hist.empty:
-                    st.line_chart(hist, height=180)
-                else:
-                    st.info("No recent price history available for that ticker.")
+                ohlc = yf.download(sel, period=period, auto_adjust=False, progress=False)[["Open","High","Low","Close"]].dropna()
+                close = ohlc["Close"]
+                ma50_s = close.rolling(50).mean()
+                ma200_s = close.rolling(200).mean()
+                # MACD on close (recompute to align 1:1 with selected series)
+                ema_fast = close.ewm(span=12, adjust=False).mean()
+                ema_slow = close.ewm(span=26, adjust=False).mean()
+                macd_line_s = ema_fast - ema_slow
+                macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                macd_hist_s = macd_line_s - macd_signal_s
 
-        # Export options
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                    row_heights=[0.7, 0.3], vertical_spacing=0.05)
+                fig.add_trace(go.Candlestick(
+                    x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+                    low=ohlc["Low"], close=ohlc["Close"], name="OHLC"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=ma50_s.index, y=ma50_s, name="MA50"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=macd_line_s.index, y=macd_line_s, name="MACD"), row=2, col=1)
+                fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"), row=2, col=1)
+                fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s, name="Hist"), row=2, col=1)
+                fig.update_layout(height=700, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
+                st.plotly_chart(fig, use_container_width=True)
+
+        # ---- Export ----
         st.subheader("Download Results")
         fmt = st.selectbox("Choose format", ["CSV", "Excel (.xlsx)"], index=0)
         if fmt == "CSV":
