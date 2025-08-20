@@ -19,7 +19,6 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
-    # Friendly message if secrets missing
     if "password" not in st.secrets or "app_password" not in st.secrets.get("password", {}):
         st.warning(
             "Password secret not set. In Streamlit Cloud go to **Settings → Secrets** and add:\n\n"
@@ -54,17 +53,13 @@ def load_sp500_symbols():
 
 @st.cache_data(show_spinner=False)
 def download_prices(tickers, period="1y"):
-    """
-    Download adjusted close prices (wide DataFrame: date index x tickers columns).
-    Ensures a DataFrame even if a single ticker; drops all-null columns.
-    """
+    """Adjusted close prices in wide format (index=date, columns=tickers)."""
     px = yf.download(tickers, period=period, auto_adjust=True, progress=False)
     if isinstance(px, pd.DataFrame) and "Close" in px.columns:
         px = px["Close"]
     if isinstance(px, pd.Series):
         px = px.to_frame()
-    px = px.dropna(how="all", axis=1)  # drop totally empty tickers
-    return px
+    return px.dropna(how="all", axis=1)
 
 def rsi_wilder(prices: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     delta = prices.diff()
@@ -80,11 +75,7 @@ def moving_average(prices: pd.DataFrame, window: int) -> pd.DataFrame:
     return prices.rolling(window).mean()
 
 def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int) -> dict:
-    """
-    Detect whether a Golden or Death cross occurred within last `lookback` rows.
-    Robust to missing data by aligning indexes first.
-    Returns dict[ticker] -> "Golden" / "Death" / None
-    """
+    """Golden/Death crosses in the last `lookback` rows (per ticker), index-aligned."""
     res = {}
     for t in short_ma.columns.intersection(long_ma.columns):
         s = short_ma[t].dropna()
@@ -127,13 +118,8 @@ def billions(x):
 
 @st.cache_data(show_spinner=False)
 def fetch_fundamentals(tickers):
-    """
-    Fetch fundamentals using yfinance.
-    Returns DataFrame indexed by ticker with columns:
-    MarketCap (USD), PE (trailingPE), DividendYield (%), Beta
-    """
     yobjs = yf.Tickers(tickers)
-    data = []
+    rows = []
     for t in tickers:
         try:
             info = yobjs.tickers[t].info
@@ -143,10 +129,10 @@ def fetch_fundamentals(tickers):
         pe = info.get("trailingPE", np.nan)
         dy = info.get("dividendYield", np.nan)
         if dy is not None and not pd.isna(dy):
-            dy = float(dy) * 100.0  # to percent
+            dy = float(dy) * 100.0
         beta = info.get("beta", np.nan)
-        data.append({"Ticker": t, "MarketCap": mc, "PE": pe, "DividendYield": dy, "Beta": beta})
-    return pd.DataFrame(data).set_index("Ticker")
+        rows.append({"Ticker": t, "MarketCap": mc, "PE": pe, "DividendYield": dy, "Beta": beta})
+    return pd.DataFrame(rows).set_index("Ticker")
 
 # =========================
 # Sidebar Controls
@@ -166,7 +152,6 @@ if cross_filter_on:
     cross_type = st.sidebar.selectbox("Crossover Type", ["Golden", "Death"], index=0)
     cross_lookback = st.sidebar.number_input("Lookback days for crossover", min_value=1, max_value=60, value=20, step=1)
 
-# MACD controls
 st.sidebar.subheader("MACD")
 macd_on = st.sidebar.checkbox("Enable MACD filter", value=False)
 if macd_on:
@@ -177,7 +162,6 @@ if macd_on:
     )
     macd_lookback = st.sidebar.number_input("Lookback days for MACD cross", 1, 60, 10, 1)
 
-# Fundamentals
 st.sidebar.subheader("Fundamental Filters")
 use_fundamentals = st.sidebar.checkbox("Enable fundamental filters", value=False, help="Fetching fundamentals may add 10–30 seconds.")
 if use_fundamentals:
@@ -188,13 +172,10 @@ if use_fundamentals:
 
 run = st.sidebar.button("Run Scan")
 
-# Keep prices for charting later
-prices = None
-macd_line = macd_signal = macd_hist = None
-
-# =========================
-# Main Scan
-# =========================
+# ============================================
+# Run the scan only when button is pressed
+# Persist outputs in st.session_state["scan"]
+# ============================================
 if run:
     with st.spinner("Fetching S&P 500 prices and calculating indicators..."):
         prices = download_prices(sp500_tickers, period=period)
@@ -202,14 +183,12 @@ if run:
             st.error("Could not download price data. Please try again.")
             st.stop()
 
-        # Indicators
         rsi14 = rsi_wilder(prices, period=14)
         ma50 = moving_average(prices, 50)
         ma200 = moving_average(prices, 200)
         macd_line, macd_signal, macd_hist = macd(prices)
 
-        # ---- Latest snapshot (safe) ----
-        prices_filled = prices.ffill()  # tiny gaps filled
+        prices_filled = prices.ffill()
         latest = pd.DataFrame({
             "Price": prices_filled.iloc[-1],
             "RSI14": rsi14.iloc[-1],
@@ -217,12 +196,10 @@ if run:
             "MA200": ma200.iloc[-1],
         }).dropna()
 
-        # ---- Technical filters ----
         filt = latest["RSI14"].between(rsi_min, rsi_max)
 
         if price_vs_ma50 != "Any":
             filt &= (latest["Price"] > latest["MA50"]) if price_vs_ma50 == "Above" else (latest["Price"] < latest["MA50"])
-
         if price_vs_ma200 != "Any":
             filt &= (latest["Price"] > latest["MA200"]) if price_vs_ma200 == "Above" else (latest["Price"] < latest["MA200"])
 
@@ -244,9 +221,8 @@ if run:
 
         results = latest[filt].sort_index()
 
-    # ---- Fundamentals (optional) ----
-    if use_fundamentals and len(results) > 0:
-        with st.spinner("Fetching fundamentals (market cap, P/E, dividend yield, beta)..."):
+        # Fundamentals (optional)
+        if use_fundamentals and len(results) > 0:
             fundamentals_df = fetch_fundamentals(results.index.tolist())
             fund_mask = pd.Series(True, index=fundamentals_df.index)
             mc_b = fundamentals_df["MarketCap"].map(billions)
@@ -256,63 +232,95 @@ if run:
             fund_mask &= fundamentals_df["Beta"].between(beta_min, beta_max).fillna(False)
             results = results.join(fundamentals_df[fund_mask], how="inner")
 
-    # ---- Scoring (simple composite) ----
-    def z(x):  # z-score helper
-        return (x - x.mean()) / (x.std(ddof=0) + 1e-9)
+        # Score (simple composite)
+        def z(x): return (x - x.mean()) / (x.std(ddof=0) + 1e-9)
+        if len(results) > 0:
+            rsi_sweet = - (results["RSI14"] - 50).abs()
+            trend_pts = (results["Price"] > results["MA50"]).astype(int) + (results["Price"] > results["MA200"]).astype(int)
+            macd_boost = pd.Series(0.0, index=results.index)
+            try:
+                macd_boost = macd_hist.iloc[-1].reindex(results.index).fillna(0.0)
+            except Exception:
+                pass
+            results["Score"] = z(rsi_sweet) + z(trend_pts) + z(macd_boost)
+            results = results.sort_values("Score", ascending=False)
 
-    if len(results) > 0:
-        rsi_sweet = - (results["RSI14"] - 50).abs()
-        trend_pts = (results["Price"] > results["MA50"]).astype(int) + (results["Price"] > results["MA200"]).astype(int)
-        macd_boost = pd.Series(0.0, indexresults:=results.index)  # fallback
-        try:
-            macd_boost = macd_hist.iloc[-1].reindex(results.index).fillna(0.0)
-        except Exception:
-            pass
-        results["Score"] = z(rsi_sweet) + z(trend_pts) + z(macd_boost)
-        results = results.sort_values("Score", ascending=False)
+        # >>> Persist all needed objects so UI changes don't wipe results
+        st.session_state["scan"] = {
+            "results": results,
+            "prices": prices,              # for sparkline/extra plots if needed
+            "period": period,
+        }
 
-    # ---- Display ----
+# =========================
+# Render results (from state if available)
+# =========================
+scan = st.session_state.get("scan")
+
+if scan is None or scan.get("results") is None:
+    st.info("Set your filters in the sidebar and click **Run Scan**.")
+else:
+    results = scan["results"]
+    period = scan["period"]
+
     st.success(f"Found {len(results)} match(es).")
     if len(results) == 0:
         st.info("No matches. Loosen filters and try again (wider RSI, MA = Any, longer lookbacks).")
     else:
         if "MarketCap" in results.columns:
             results = results.copy()
-            results["MarketCap ($B)"] = results["MarketCap"].map(billions).round(2)
-            first_cols = ["Score", "Price", "RSI14", "MA50", "MA200"]
+            if "MarketCap ($B)" not in results.columns:
+                results["MarketCap ($B)"] = results["MarketCap"].map(billions).round(2)
+            base_cols = ["Score"] if "Score" in results.columns else []
+            first_cols = base_cols + ["Price", "RSI14", "MA50", "MA200"]
             extras = [c for c in ["MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in results.columns]
             results = results[first_cols + extras]
         st.dataframe(results, use_container_width=True)
 
-        # ---- Full interactive chart (candles + MAs + MACD) ----
+        # ---------- Full interactive chart ----------
         with st.expander("Open full interactive chart"):
-            sel = st.selectbox("Choose ticker", results.index.tolist())
+            sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
             if sel:
-                ohlc = yf.download(sel, period=period, auto_adjust=False, progress=False)[["Open","High","Low","Close"]].dropna()
-                close = ohlc["Close"]
-                ma50_s = close.rolling(50).mean()
-                ma200_s = close.rolling(200).mean()
-                # MACD on close (recompute to align 1:1 with selected series)
-                ema_fast = close.ewm(span=12, adjust=False).mean()
-                ema_slow = close.ewm(span=26, adjust=False).mean()
-                macd_line_s = ema_fast - ema_slow
-                macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
-                macd_hist_s = macd_line_s - macd_signal_s
+                # Use raw OHLC (not auto_adjust) so candlesticks are valid
+                ohlc = yf.download(sel, period=period, auto_adjust=False, progress=False)
+                needed = ["Open", "High", "Low", "Close"]
+                if not set(needed).issubset(ohlc.columns):
+                    st.info("Not enough OHLC data to chart this ticker right now.")
+                else:
+                    ohlc = ohlc[needed].dropna()
+                    if len(ohlc) < 10:
+                        st.info("Too few data points to draw a meaningful chart.")
+                    else:
+                        close = ohlc["Close"]
+                        ma50_s = close.rolling(50).mean()
+                        ma200_s = close.rolling(200).mean()
+                        # MACD (recomputed on the same series)
+                        ema_fast = close.ewm(span=12, adjust=False).mean()
+                        ema_slow = close.ewm(span=26, adjust=False).mean()
+                        macd_line_s = ema_fast - ema_slow
+                        macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                        macd_hist_s = macd_line_s - macd_signal_s
 
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                    row_heights=[0.7, 0.3], vertical_spacing=0.05)
-                fig.add_trace(go.Candlestick(
-                    x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
-                    low=ohlc["Low"], close=ohlc["Close"], name="OHLC"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=ma50_s.index, y=ma50_s, name="MA50"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=macd_line_s.index, y=macd_line_s, name="MACD"), row=2, col=1)
-                fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"), row=2, col=1)
-                fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s, name="Hist"), row=2, col=1)
-                fig.update_layout(height=700, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
-                st.plotly_chart(fig, use_container_width=True)
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                            row_heights=[0.7, 0.3], vertical_spacing=0.05)
 
-        # ---- Export ----
+                        fig.add_trace(go.Candlestick(
+                            x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+                            low=ohlc["Low"], close=ohlc["Close"], name="OHLC"), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=ma50_s.index, y=ma50_s, name="MA50"), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
+
+                        fig.add_trace(go.Scatter(x=macd_line_s.index, y=macd_line_s, name="MACD"), row=2, col=1)
+                        fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"), row=2, col=1)
+                        fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s, name="Hist"), row=2, col=1)
+
+                        # Hide weekend gaps to make the chart dense
+                        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+                        fig.update_layout(height=700, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+        # ---------- Export ----------
         st.subheader("Download Results")
         fmt = st.selectbox("Choose format", ["CSV", "Excel (.xlsx)"], index=0)
         if fmt == "CSV":
@@ -328,6 +336,3 @@ if run:
                 file_name="stock_scan_results.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
-else:
-    st.info("Set your filters in the sidebar and click **Run Scan**.")
