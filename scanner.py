@@ -277,80 +277,114 @@ else:
         st.dataframe(results, use_container_width=True)
 
         # ---- Full interactive chart (guarded; candles if possible, else line fallback) ----
-        with st.expander("Open full interactive chart"):
-            sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
-            if sel:
-                # Try to get full OHLC for candlesticks
-                raw = yf.download(sel, period=period, auto_adjust=False, progress=False)
-                have_ohlc = set(["Open", "High", "Low", "Close"]).issubset(raw.columns)
-                if have_ohlc:
-                    ohlc = raw[["Open", "High", "Low", "Close"]].dropna()
-                else:
-                    ohlc = pd.DataFrame()
+with st.expander("Open full interactive chart"):
+    sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
+    if sel:
+        # ---------- helper to pretty up axes ----------
+        def finalize_axes(fig):
+            # nice month labels, hide weekend gaps
+            fig.update_xaxes(tickformat="%b %Y", rangebreaks=[dict(bounds=["sat", "mon"])], showspikes=True)
+            # price axis
+            fig.update_yaxes(title_text="Price", tickformat="$,.0f", row=1, col=1, showspikes=True)
+            # macd axis
+            fig.update_yaxes(title_text="MACD", tickformat=".2f", row=2, col=1, zeroline=True, zerolinecolor="gray")
+            # style
+            fig.update_layout(
+                height=700,
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis_rangeslider_visible=False,
+            )
+            # histogram bars less “shouty”
+            fig.update_traces(marker_opacity=0.35, selector=dict(type="bar"))
 
-                if have_ohlc and len(ohlc) >= 5:
-                    close = ohlc["Close"]
-                    ma50_s = close.rolling(50).mean()
-                    ma200_s = close.rolling(200).mean()
+        # Try to get full OHLC for candlesticks
+        raw = yf.download(sel, period=period, auto_adjust=False, progress=False)
+        # Make sure index is datetime (some returns can be object-typed)
+        try:
+            raw.index = pd.to_datetime(raw.index)
+        except Exception:
+            pass
 
-                    ema_fast = close.ewm(span=12, adjust=False).mean()
-                    ema_slow = close.ewm(span=26, adjust=False).mean()
-                    macd_line_s = ema_fast - ema_slow
-                    macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
-                    macd_hist_s = macd_line_s - macd_signal_s
+        have_ohlc = set(["Open", "High", "Low", "Close"]).issubset(raw.columns)
+        ohlc = raw[["Open", "High", "Low", "Close"]].dropna() if have_ohlc else pd.DataFrame()
 
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                        row_heights=[0.7, 0.3], vertical_spacing=0.05)
+        # ----------- CANDLE VIEW -----------
+        if have_ohlc and len(ohlc) >= 20:
+            close = ohlc["Close"]
+            ma50_s  = close.rolling(50).mean()
+            ma200_s = close.rolling(200).mean()
 
-                    fig.add_trace(go.Candlestick(
-                        x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
-                        low=ohlc["Low"], close=ohlc["Close"], name="OHLC"), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=ma50_s.index, y=ma50_s, name="MA50"), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
+            # MACD on Close
+            ema_fast = close.ewm(span=12, adjust=False).mean()
+            ema_slow = close.ewm(span=26, adjust=False).mean()
+            macd_line_s   = ema_fast - ema_slow
+            macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+            macd_hist_s   = (macd_line_s - macd_signal_s).dropna()
 
-                    fig.add_trace(go.Scatter(x=macd_line_s.index, y=macd_line_s, name="MACD"), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"), row=2, col=1)
-                    fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s, name="Hist"), row=2, col=1)
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                row_heights=[0.7, 0.3], vertical_spacing=0.05)
 
-                    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-                    fig.update_layout(height=700, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
-                    st.plotly_chart(fig, use_container_width=True)
+            fig.add_trace(go.Candlestick(
+                x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+                low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
+            ), row=1, col=1)
 
-                else:
-                    # Fallback: adjusted close line + MAs + MACD
-                    adj = yf.download(sel, period=period, auto_adjust=True, progress=False)
-                    if "Close" in adj.columns:
-                        s = adj["Close"].dropna()
-                    elif "Adj Close" in adj.columns:
-                        s = adj["Adj Close"].dropna()
-                    else:
-                        s = pd.Series(dtype=float)
+            fig.add_trace(go.Scatter(x=ma50_s.index,  y=ma50_s,  name="MA50"),  row=1, col=1)
+            fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
 
-                    if s.empty or len(s) < 3:
-                        st.info("Data for this ticker is unusually sparse right now. Try a different period (e.g., 2y) or another ticker.")
-                    else:
-                        ma50_s = s.rolling(50).mean()
-                        ma200_s = s.rolling(200).mean()
-                        ema_fast = s.ewm(span=12, adjust=False).mean()
-                        ema_slow = s.ewm(span=26, adjust=False).mean()
-                        macd_line_s = ema_fast - ema_slow
-                        macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
-                        macd_hist_s = macd_line_s - macd_signal_s
+            fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,   name="MACD"),  row=2, col=1)
+            fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"),row=2, col=1)
+            fig.add_trace(go.Bar(    x=macd_hist_s.index,   y=macd_hist_s,   name="Hist"),  row=2, col=1)
 
-                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                            row_heights=[0.7, 0.3], vertical_spacing=0.05)
+            # symmetric MACD range
+            max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) if len(macd_hist_s) else 1.0
+            r = 1.2 * max_abs if max_abs > 0 else 1.0
+            fig.update_yaxes(range=[-r, r], row=2, col=1)
+            # zero reference
+            fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
 
-                        fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close"), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=ma50_s.index, y=ma50_s, name="MA50"), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
+            finalize_axes(fig)
+            st.plotly_chart(fig, use_container_width=True)
 
-                        fig.add_trace(go.Scatter(x=macd_line_s.index, y=macd_line_s, name="MACD"), row=2, col=1)
-                        fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"), row=2, col=1)
-                        fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s, name="Hist"), row=2, col=1)
+        # ----------- LINE FALLBACK -----------
+        else:
+            adj = yf.download(sel, period=period, auto_adjust=True, progress=False)
+            try:
+                adj.index = pd.to_datetime(adj.index)
+            except Exception:
+                pass
 
-                        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-                        fig.update_layout(height=700, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
-                        st.plotly_chart(fig, use_container_width=True)
+            s = (adj["Close"] if "Close" in adj.columns else adj.get("Adj Close", pd.Series(dtype=float))).dropna()
+            if s.empty or len(s) < 20:
+                st.info("Data for this ticker is sparse right now. Try a longer period (e.g., 2y) or another ticker.")
+            else:
+                ma50_s  = s.rolling(50).mean()
+                ma200_s = s.rolling(200).mean()
+                ema_fast = s.ewm(span=12, adjust=False).mean()
+                ema_slow = s.ewm(span=26, adjust=False).mean()
+                macd_line_s   = ema_fast - ema_slow
+                macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                macd_hist_s   = (macd_line_s - macd_signal_s).dropna()
+
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                    row_heights=[0.7, 0.3], vertical_spacing=0.05)
+
+                fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=ma50_s.index,  y=ma50_s,  name="MA50"),  row=1, col=1)
+                fig.add_trace(go.Scatter(x=ma200_s.index, y=ma200_s, name="MA200"), row=1, col=1)
+
+                fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,   name="MACD"),  row=2, col=1)
+                fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal"),row=2, col=1)
+                fig.add_trace(go.Bar(    x=macd_hist_s.index,   y=macd_hist_s,   name="Hist"),  row=2, col=1)
+
+                max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) if len(macd_hist_s) else 1.0
+                r = 1.2 * max_abs if max_abs > 0 else 1.0
+                fig.update_yaxes(range=[-r, r], row=2, col=1)
+                fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+
+                finalize_axes(fig)
+                st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Export ----------
         st.subheader("Download Results")
