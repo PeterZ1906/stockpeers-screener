@@ -5,15 +5,24 @@ import yfinance as yf
 from io import BytesIO
 
 # =========================
-# Password protection (uses Streamlit Secrets)
+# Password protection (Streamlit Secrets)
 # =========================
 def check_password():
     def password_entered():
-        if st.session_state.get("password") == st.secrets["password"]["app_password"]:
+        expected = st.secrets.get("password", {}).get("app_password")
+        if expected and st.session_state.get("password") == expected:
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
+
+    # If secrets missing, show a friendly message instead of KeyError
+    if "password" not in st.secrets or "app_password" not in st.secrets.get("password", {}):
+        st.warning(
+            "Password secret not set. In Streamlit Cloud go to **Settings → Secrets** and add:\n\n"
+            "[password]\napp_password = \"StockPeers2024!\""
+        )
+        st.stop()
 
     if "password_correct" not in st.session_state:
         st.text_input("Enter Password", type="password", on_change=password_entered, key="password")
@@ -38,22 +47,27 @@ st.title("📊 StockPeers Screener")
 def load_sp500_symbols():
     url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
     df = pd.read_csv(url)
-    return sorted(df["Symbol"].unique().tolist())
+    return sorted(df["Symbol"].dropna().unique().tolist())
 
 @st.cache_data(show_spinner=False)
 def download_prices(tickers, period="1y"):
-    """Download adjusted close prices (wide DataFrame: date index x tickers columns)."""
+    """
+    Download adjusted close prices (wide DataFrame: date index x tickers columns).
+    Ensures a DataFrame even if a single ticker; drops all-null columns.
+    """
     px = yf.download(tickers, period=period, auto_adjust=True, progress=False)
     if isinstance(px, pd.DataFrame) and "Close" in px.columns:
         px = px["Close"]
     if isinstance(px, pd.Series):
         px = px.to_frame()
-    return px.dropna(how="all")
+    # drop columns completely empty (some symbols occasionally fail)
+    px = px.dropna(how="all", axis=1)
+    return px
 
 def rsi_wilder(prices: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     delta = prices.diff()
     gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    loss = (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
@@ -64,17 +78,22 @@ def moving_average(prices: pd.DataFrame, window: int) -> pd.DataFrame:
     return prices.rolling(window).mean()
 
 def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int) -> dict:
+    """
+    Detect whether a Golden or Death cross occurred within the last `lookback` rows.
+    Returns dict[ticker] -> "Golden" / "Death" / None
+    Robust to short history and NaNs.
+    """
     res = {}
-    common_cols = [c for c in short_ma.columns if c in long_ma.columns]
-    for t in common_cols:
+    cols = [c for c in short_ma.columns if c in long_ma.columns]
+    for t in cols:
         s = short_ma[t].dropna()
         l = long_ma[t].dropna()
-        n = min(len(s), len(l))
-        if n < 2:
+        if len(s) < 2 or len(l) < 2:
             res[t] = None
             continue
-        s_recent = s.iloc[-(lookback+1):]
-        l_recent = l.iloc[-(lookback+1):]
+        n = min(len(s), len(l))
+        s_recent = s.iloc[max(0, n - (lookback + 1)): ]
+        l_recent = l.iloc[max(0, n - (lookback + 1)): ]
         if len(s_recent) < 2 or len(l_recent) < 2:
             res[t] = None
             continue
@@ -88,6 +107,11 @@ def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int)
             res[t] = None
     return res
 
+def billions(x):
+    if pd.isna(x):
+        return np.nan
+    return float(x) / 1e9
+
 @st.cache_data(show_spinner=False)
 def fetch_fundamentals(tickers):
     """
@@ -95,8 +119,8 @@ def fetch_fundamentals(tickers):
     Returns DataFrame indexed by ticker with columns:
     MarketCap (USD), PE (trailingPE), DividendYield (%), Beta
     """
-    data = []
     yobjs = yf.Tickers(tickers)
+    data = []
     for t in tickers:
         try:
             info = yobjs.tickers[t].info
@@ -106,27 +130,19 @@ def fetch_fundamentals(tickers):
         pe = info.get("trailingPE", np.nan)
         dy = info.get("dividendYield", np.nan)
         if dy is not None and not pd.isna(dy):
-            dy = float(dy) * 100.0
+            dy = float(dy) * 100.0  # to percent
         beta = info.get("beta", np.nan)
         data.append({"Ticker": t, "MarketCap": mc, "PE": pe, "DividendYield": dy, "Beta": beta})
-    df = pd.DataFrame(data).set_index("Ticker")
-    return df
-
-def billions(x):
-    if pd.isna(x):
-        return np.nan
-    return float(x) / 1e9
+    return pd.DataFrame(data).set_index("Ticker")
 
 # =========================
 # Sidebar Controls
 # =========================
 st.sidebar.header("Filters")
 
-# Universe: S&P 500 only (auto)
 sp500_tickers = load_sp500_symbols()
 st.sidebar.caption(f"S&P 500 universe loaded: {len(sp500_tickers)} tickers")
 
-# Technical Parameters
 period = st.sidebar.selectbox("Price history period", ["6mo", "1y", "2y"], index=1)
 rsi_min, rsi_max = st.sidebar.slider("RSI Range (14)", 0, 100, (30, 70), step=1)
 price_vs_ma50 = st.sidebar.selectbox("Price vs 50-day MA", ["Any", "Above", "Below"], index=0)
@@ -135,9 +151,8 @@ price_vs_ma200 = st.sidebar.selectbox("Price vs 200-day MA", ["Any", "Above", "B
 cross_filter_on = st.sidebar.checkbox("Require recent MA crossover (50 vs 200)?", value=False)
 if cross_filter_on:
     cross_type = st.sidebar.selectbox("Crossover Type", ["Golden", "Death"], index=0)
-    cross_lookback = st.sidebar.number_input("Lookback days for crossover", min_value=1, max_value=60, value=5, step=1)
+    cross_lookback = st.sidebar.number_input("Lookback days for crossover", min_value=1, max_value=60, value=20, step=1)
 
-# Fundamental Filters
 st.sidebar.subheader("Fundamental Filters")
 use_fundamentals = st.sidebar.checkbox("Enable fundamental filters", value=False, help="Fetching fundamentals may add 10–30 seconds.")
 if use_fundamentals:
@@ -148,26 +163,36 @@ if use_fundamentals:
 
 run = st.sidebar.button("Run Scan")
 
+# Keep these in outer scope so the sparkline expander can use them after a run
+prices = None
+
 # =========================
 # Main Scan
 # =========================
 if run:
     with st.spinner("Fetching S&P 500 prices and calculating indicators..."):
         prices = download_prices(sp500_tickers, period=period)
+        if prices is None or prices.empty:
+            st.error("Could not download price data. Please try again.")
+            st.stop()
+
+        # Indicators
         rsi14 = rsi_wilder(prices, period=14)
         ma50 = moving_average(prices, 50)
         ma200 = moving_average(prices, 200)
 
-        latest_idx = prices.dropna().index.max()
+        # ---- Build latest snapshot safely (FIX) ----
+        # Forward-fill tiny holes so the last row is usable
+        prices_filled = prices.ffill()
         latest = pd.DataFrame({
-            "Price": prices.loc[latest_idx],
-            "RSI14": rsi14.loc[latest_idx],
-            "MA50": ma50.loc[latest_idx],
-            "MA200": ma200.loc[latest_idx],
+            "Price": prices_filled.iloc[-1],
+            "RSI14": rsi14.iloc[-1],
+            "MA50": ma50.iloc[-1],
+            "MA200": ma200.iloc[-1],
         }).dropna()
 
-        # Technical Filters
-        filt = (latest["RSI14"].between(rsi_min, rsi_max))
+        # Technical filters
+        filt = latest["RSI14"].between(rsi_min, rsi_max)
 
         if price_vs_ma50 != "Any":
             if price_vs_ma50 == "Above":
@@ -182,7 +207,7 @@ if run:
                 filt &= latest["Price"] < latest["MA200"]
 
         if cross_filter_on:
-            crosses = recent_crosses(ma50, ma200, lookback=cross_lookback)
+            crosses = recent_crosses(ma50, ma200, lookback=int(cross_lookback))
             cross_mask = latest.index.to_series().map(lambda t: crosses.get(t) == cross_type)
             filt &= cross_mask.fillna(False)
 
@@ -192,22 +217,18 @@ if run:
     if use_fundamentals and len(results) > 0:
         with st.spinner("Fetching fundamentals (market cap, P/E, dividend yield, beta)..."):
             fundamentals_df = fetch_fundamentals(results.index.tolist())
-            # Apply fundamental filters
             fund_mask = pd.Series(True, index=fundamentals_df.index)
 
             mc_b = fundamentals_df["MarketCap"].map(billions)
             fund_mask &= mc_b.between(cap_min_b, cap_max_b)
 
-            pe_vals = fundamentals_df["PE"]
-            pe_ok = pe_vals.between(pe_min, pe_max).fillna(False)
+            pe_ok = fundamentals_df["PE"].between(pe_min, pe_max).fillna(False)
             fund_mask &= pe_ok
 
-            dy_vals = fundamentals_df["DividendYield"]
-            dy_ok = dy_vals.fillna(0.0) >= dy_min
+            dy_ok = fundamentals_df["DividendYield"].fillna(0.0) >= dy_min
             fund_mask &= dy_ok
 
-            beta_vals = fundamentals_df["Beta"]
-            beta_ok = beta_vals.between(beta_min, beta_max).fillna(False)
+            beta_ok = fundamentals_df["Beta"].between(beta_min, beta_max).fillna(False)
             fund_mask &= beta_ok
 
             results = results.join(fundamentals_df[fund_mask], how="inner")
@@ -215,8 +236,9 @@ if run:
     # Display
     st.success(f"Found {len(results)} match(es).")
     if len(results) == 0:
-        st.info("No matches. Loosen filters and try again.")
+        st.info("No matches. Loosen filters and try again (e.g., wider RSI, MA = Any, longer crossover lookback).")
     else:
+        # Pretty market cap column if present
         if "MarketCap" in results.columns:
             results = results.copy()
             results["MarketCap ($B)"] = results["MarketCap"].map(billions).round(2)
@@ -230,8 +252,11 @@ if run:
         with st.expander("Show mini price chart (sparkline) for a ticker"):
             sel = st.selectbox("Choose ticker", results.index.tolist())
             if sel:
-                hist = download_prices([sel], period="6mo")
-                st.line_chart(hist, height=180)
+                hist = prices[[sel]].dropna().tail(180) if prices is not None else None
+                if hist is not None and not hist.empty:
+                    st.line_chart(hist, height=180)
+                else:
+                    st.info("No recent price history available for that ticker.")
 
         # Export options
         st.subheader("Download Results")
