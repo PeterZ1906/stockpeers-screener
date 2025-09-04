@@ -76,7 +76,6 @@ def download_prices(tickers, period="1y"):
         elif "Adj Close" in set(lvl0):
             out = df["Adj Close"]
         else:
-            # fallback: first numeric level
             first = lvl0.unique()[0]
             out = df[first]
         out.columns = [str(c) for c in out.columns]  # plain ticker names
@@ -322,7 +321,6 @@ scan = st.session_state.get("scan")
 if scan is None or scan.get("results") is None:
     st.info("Set your filters in the sidebar and click **Run Scan**.")
 
-    # Safe expander BEFORE a scan
     with st.expander("Open full interactive chart"):
         st.info("Run a scan first to enable charting.")
 
@@ -345,118 +343,115 @@ else:
         st.dataframe(tbl[cols] if cols else tbl, use_container_width=True)
 
         # ----------------- CHART EXPANDER (robust) -----------------
-with st.expander("Open full interactive chart"):
-    sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
-    chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
+        with st.expander("Open full interactive chart"):
+            sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
+            chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
 
-    def fetch_series(ticker, per):
-        """Always return a 1D adjusted-close Series for the ticker."""
-        # 1d for <=2y, 1wk otherwise — keeps plots responsive
-        interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
-        df = yf.download(ticker, period=per, interval=interval, auto_adjust=True, progress=False)
-        if isinstance(df, pd.DataFrame):
-            if "Close" in df.columns:
-                s = df["Close"].dropna()
-            elif "Adj Close" in df.columns:
-                s = df["Adj Close"].dropna()
-            else:
-                # last numeric column fallback
-                s = df.select_dtypes(include=[np.number]).iloc[:, -1].dropna()
-        else:
-            s = pd.Series(dtype=float)
-        try:
-            s.index = pd.to_datetime(s.index)
-        except Exception:
-            pass
-        return s
+            def fetch_series(ticker, per):
+                """Always return a 1D adjusted-close Series for the ticker."""
+                interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
+                df = yf.download(ticker, period=per, interval=interval, auto_adjust=True, progress=False)
+                if isinstance(df, pd.DataFrame):
+                    if "Close" in df.columns:
+                        s = df["Close"].dropna()
+                    elif "Adj Close" in df.columns:
+                        s = df["Adj Close"].dropna()
+                    else:
+                        s = df.select_dtypes(include=[np.number]).iloc[:, -1].dropna()
+                else:
+                    s = pd.Series(dtype=float)
+                try:
+                    s.index = pd.to_datetime(s.index)
+                except Exception:
+                    pass
+                return s
 
-    def fetch_ohlc(ticker, per):
-        """Try to return full OHLC for candles (optional)."""
-        interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
-        df = yf.download(ticker, period=per, interval=interval, auto_adjust=False, progress=False)
-        if isinstance(df, pd.DataFrame) and {"Open","High","Low","Close"}.issubset(df.columns):
-            df = df[["Open","High","Low","Close"]].dropna()
-            try:
-                df.index = pd.to_datetime(df.index)
-            except Exception:
-                pass
-            return df
-        return pd.DataFrame()
+            def fetch_ohlc(ticker, per):
+                """Try to return full OHLC for candles (optional)."""
+                interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
+                df = yf.download(ticker, period=per, interval=interval, auto_adjust=False, progress=False)
+                if isinstance(df, pd.DataFrame) and {"Open","High","Low","Close"}.issubset(df.columns):
+                    df = df[["Open","High","Low","Close"]].dropna()
+                    try:
+                        df.index = pd.to_datetime(df.index)
+                    except Exception:
+                        pass
+                    return df
+                return pd.DataFrame()
 
-    def finish_layout(fig):
-        fig.update_xaxes(
-            tickformat="%b %Y",
-            rangebreaks=[dict(bounds=["sat","mon"])],
-            showspikes=True
-        )
-        fig.update_yaxes(title_text="Price", tickformat="$,.0f", row=1, col=1, showspikes=True)
-        fig.update_yaxes(title_text="MACD",  tickformat=".2f",  row=2, col=1, zeroline=True, zerolinecolor="gray")
-        fig.update_layout(
-            height=720, hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis_rangeslider_visible=False,
-        )
-        fig.update_traces(marker_opacity=0.35, selector=dict(type="bar"))
+            def finish_layout(fig):
+                fig.update_xaxes(
+                    tickformat="%b %Y",
+                    rangebreaks=[dict(bounds=["sat","mon"])],
+                    showspikes=True
+                )
+                fig.update_yaxes(title_text="Price", tickformat="$,.0f", row=1, col=1, showspikes=True)
+                fig.update_yaxes(title_text="MACD",  tickformat=".2f",  row=2, col=1, zeroline=True, zerolinecolor="gray")
+                fig.update_layout(
+                    height=720, hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    xaxis_rangeslider_visible=False,
+                )
+                fig.update_traces(marker_opacity=0.35, selector=dict(type="bar"))
 
-    if sel:
-        # 1) Get adjusted close (primary data for chart)
-        widen = {"6mo":"1y","1y":"2y","2y":"5y","5y":"10y","10y":"max"}
-        p = chart_period
-        s = fetch_series(sel, p)
-        while len(s) < 120 and p in widen:   # ensure enough bars
-            p = widen[p]
-            s = fetch_series(sel, p)
+            if sel:
+                # 1) Get adjusted close (primary data for chart)
+                widen = {"6mo":"1y","1y":"2y","2y":"5y","5y":"10y","10y":"max"}
+                p = chart_period
+                s = fetch_series(sel, p)
+                while len(s) < 120 and p in widen:   # ensure enough bars
+                    p = widen[p]
+                    s = fetch_series(sel, p)
 
-        if s.empty:
-            st.info("No chartable data returned for this selection. Try a longer chart period.")
-        else:
-            # Build indicators from s
-            ma50s  = s.rolling(50,  min_periods=1).mean()
-            ma200s = s.rolling(200, min_periods=1).mean()
-            ema_fast = s.ewm(span=12, adjust=False).mean()
-            ema_slow = s.ewm(span=26, adjust=False).mean()
-            macd_line_s   = ema_fast - ema_slow
-            macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
-            macd_hist_s   = (macd_line_s - macd_signal_s).dropna()
+                if s.empty:
+                    st.info("No chartable data returned for this selection. Try a longer chart period.")
+                else:
+                    # Build indicators from s
+                    ma50s  = s.rolling(50,  min_periods=1).mean()
+                    ma200s = s.rolling(200, min_periods=1).mean()
+                    ema_fast = s.ewm(span=12, adjust=False).mean()
+                    ema_slow = s.ewm(span=26, adjust=False).mean()
+                    macd_line_s   = ema_fast - ema_slow
+                    macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                    macd_hist_s   = (macd_line_s - macd_signal_s).dropna()
 
-            # 2) Make the figure (line chart always works)
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                row_heights=[0.7, 0.3], vertical_spacing=0.05)
+                    # 2) Make the figure (line chart always works)
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                        row_heights=[0.7, 0.3], vertical_spacing=0.05)
 
-            # Try adding candles if we can get OHLC
-            ohlc = fetch_ohlc(sel, p)
-            if not ohlc.empty and len(ohlc) >= 20:
-                fig.add_trace(go.Candlestick(
-                    x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
-                    low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
-                ), row=1, col=1)
-            else:
-                # fallback line
-                fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close",
-                                         mode="lines", connectgaps=True), row=1, col=1)
+                    # Try adding candles if we can get OHLC
+                    ohlc = fetch_ohlc(sel, p)
+                    if not ohlc.empty and len(ohlc) >= 20:
+                        fig.add_trace(go.Candlestick(
+                            x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+                            low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
+                        ), row=1, col=1)
+                    else:
+                        # fallback line
+                        fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close",
+                                                 mode="lines", connectgaps=True), row=1, col=1)
 
-            # MAs
-            fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",
-                                     mode="lines", connectgaps=True), row=1, col=1)
-            fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200",
-                                     mode="lines", connectgaps=True), row=1, col=1)
+                    # MAs
+                    fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",
+                                             mode="lines", connectgaps=True), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200",
+                                             mode="lines", connectgaps=True), row=1, col=1)
 
-            # MACD
-            fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,
-                                     name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
-            fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s,
-                                     name="Signal",mode="lines", connectgaps=True), row=2, col=1)
-            fig.add_trace(go.Bar(    x=macd_hist_s.index,   y=macd_hist_s,
-                                     name="Hist"), row=2, col=1)
+                    # MACD
+                    fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,
+                                             name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s,
+                                             name="Signal",mode="lines", connectgaps=True), row=2, col=1)
+                    fig.add_trace(go.Bar(    x=macd_hist_s.index,   y=macd_hist_s,
+                                             name="Hist"), row=2, col=1)
 
-            max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) if len(macd_hist_s) else 1.0
-            r = 1.2 * max_abs if max_abs > 0 else 1.0
-            fig.update_yaxes(range=[-r, r], row=2, col=1)
-            fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+                    max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) if len(macd_hist_s) else 1.0
+                    r = 1.2 * max_abs if max_abs > 0 else 1.0
+                    fig.update_yaxes(range=[-r, r], row=2, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
 
-            finish_layout(fig)
-            st.plotly_chart(fig, use_container_width=True)
-
+                    finish_layout(fig)
+                    st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Export ----------
         st.subheader("Download Results")
