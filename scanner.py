@@ -343,149 +343,160 @@ else:
         st.dataframe(tbl[cols] if cols else tbl, use_container_width=True)
 
         # ----------------- CHART EXPANDER (better UX) -----------------
-with st.expander("Open full interactive chart"):
-    sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
-    chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
+        with st.expander("Open full interactive chart"):
+            sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
+            chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
 
-    view_mode = st.radio(
-        "View mode",
-        ["Price (actual)", "% change (rebased)", "Log price"],
-        index=0,
-        horizontal=True,
-        help="Switch to % or Log for long horizons to make moves visible."
-    )
-    focus = st.selectbox(
-        "Focus window",
-        ["Full", "Last 6m", "Last 1y", "Last 2y", "Last 5y"],
-        index=1
-    )
+            view_mode = st.radio(
+                "View mode",
+                ["Price (actual)", "% change (rebased)", "Log price"],
+                index=0,
+                horizontal=True,
+                help="Switch to % or Log for long horizons to make moves visible."
+            )
+            focus = st.selectbox(
+                "Focus window",
+                ["Full", "Last 6m", "Last 1y", "Last 2y", "Last 5y"],
+                index=1
+            )
 
-    def fetch_series(ticker, per):
-        """Adjusted close series. 1d for <=2y; 1wk otherwise."""
-        interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
-        df = yf.download(ticker, period=per, interval=interval, auto_adjust=True, progress=False)
-        if isinstance(df, pd.DataFrame):
-            if "Close" in df.columns:
-                s = df["Close"].dropna()
-            elif "Adj Close" in df.columns:
-                s = df["Adj Close"].dropna()
-            else:
-                s = df.select_dtypes(include=[np.number]).iloc[:, -1].dropna()
-        else:
-            s = pd.Series(dtype=float)
-        try:
-            s.index = pd.to_datetime(s.index)
-        except Exception:
-            pass
-        return s
-
-    def fetch_ohlc(ticker, per):
-        """Optional OHLC for candles."""
-        interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
-        df = yf.download(ticker, period=per, interval=interval, auto_adjust=False, progress=False)
-        if isinstance(df, pd.DataFrame) and {"Open","High","Low","Close"}.issubset(df.columns):
-            df = df[["Open","High","Low","Close"]].dropna()
-            try:
-                df.index = pd.to_datetime(df.index)
-            except Exception:
-                pass
-            return df
-        return pd.DataFrame()
-
-    def finish_layout(fig, ytype="linear", ytitle="Price"):
-        fig.update_xaxes(
-            tickformat="%b %Y",
-            rangebreaks=[dict(bounds=["sat","mon"])],
-            showspikes=True
-        )
-        fig.update_yaxes(type=ytype, title_text=ytitle, tickformat="$,.0f" if ytype!="percent" else ",.1f%", row=1, col=1, showspikes=True)
-        fig.update_yaxes(title_text="MACD", tickformat=".2f", row=2, col=1, zeroline=True, zerolinecolor="gray")
-        fig.update_layout(
-            height=720, hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis_rangeslider_visible=False,
-        )
-        # color bars red/green automatically handled below
-
-    if not sel:
-        st.info("Choose a ticker above to draw the chart.")
-    else:
-        # 1) Base series
-        widen = {"6mo":"1y","1y":"2y","2y":"5y","5y":"10y","10y":"max"}
-        p = chart_period
-        s = fetch_series(sel, p)
-        while len(s) < 120 and p in widen:
-            p = widen[p]
-            s = fetch_series(sel, p)
-
-        if s.empty:
-            st.info("No chartable data returned. Try a longer chart period.")
-        else:
-            # 2) Focus window without refetching
-            if focus != "Full":
-                nmap = {"Last 6m": 180, "Last 1y": 365, "Last 2y": 730, "Last 5y": 1825}
-                n = nmap.get(focus, None)
-                if n and len(s) > n:
-                    s = s.tail(n)
-
-            # 3) Indicators from current slice
-            ma50s  = s.rolling(50,  min_periods=1).mean()
-            ma200s = s.rolling(200, min_periods=1).mean()
-            ema_fast = s.ewm(span=12, adjust=False).mean()
-            ema_slow = s.ewm(span=26, adjust=False).mean()
-            macd_line_s   = ema_fast - ema_slow
-            macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
-            macd_hist_s   = (macd_line_s - macd_signal_s)
-
-            # 4) Build figure
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-
-            # Candles if we can get OHLC for the same slice, else line
-            ohlc = fetch_ohlc(sel, p)
-            if not ohlc.empty:
-                if focus != "Full":
-                    ohlc = ohlc.loc[s.index.min(): s.index.max()]
-            have_candles = not ohlc.empty and len(ohlc) >= 20
-
-            if view_mode == "% change (rebased)":
-                base = s.iloc[0]
-                y = (s / base - 1.0) * 100.0
-                ytitle = "Return (%)"
-                fig.add_trace(go.Scatter(x=y.index, y=y, name="% change", mode="lines", connectgaps=True), row=1, col=1)
-                # Rebase MAs, too
-                m50  = (ma50s / base - 1.0) * 100.0
-                m200 = (ma200s / base - 1.0) * 100.0
-                fig.add_trace(go.Scatter(x=m50.index,  y=m50,  name="MA50",  mode="lines", connectgaps=True), row=1, col=1)
-                fig.add_trace(go.Scatter(x=m200.index, y=m200, name="MA200", mode="lines", connectgaps=True), row=1, col=1)
-                ytype = "linear"   # use % axis
-            else:
-                if have_candles and view_mode != "% change (rebased)":
-                    fig.add_trace(go.Candlestick(
-                        x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
-                        low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
-                    ), row=1, col=1)
+            def fetch_series(ticker, per):
+                """Adjusted close series. 1d for <=2y; 1wk otherwise."""
+                interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
+                df = yf.download(ticker, period=per, interval=interval, auto_adjust=True, progress=False)
+                if isinstance(df, pd.DataFrame):
+                    if "Close" in df.columns:
+                        s = df["Close"].dropna()
+                    elif "Adj Close" in df.columns:
+                        s = df["Adj Close"].dropna()
+                    else:
+                        s = df.select_dtypes(include=[np.number]).iloc[:, -1].dropna()
                 else:
-                    fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close", mode="lines", connectgaps=True), row=1, col=1)
-                fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",  mode="lines", connectgaps=True), row=1, col=1)
-                fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200", mode="lines", connectgaps=True), row=1, col=1)
-                ytitle = "Price"
-                ytype  = "log" if view_mode == "Log price" else "linear"
+                    s = pd.Series(dtype=float)
+                try:
+                    s.index = pd.to_datetime(s.index)
+                except Exception:
+                    pass
+                return s
 
-            # MACD panel with colored histogram
-            colors = np.where(macd_hist_s >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
-            fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s, name="Hist", marker_color=colors), row=2, col=1)
-            fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,   name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
-            fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal",mode="lines", connectgaps=True), row=2, col=1)
-            fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+            def fetch_ohlc(ticker, per):
+                """Optional OHLC for candles."""
+                interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
+                df = yf.download(ticker, period=per, interval=interval, auto_adjust=False, progress=False)
+                if isinstance(df, pd.DataFrame) and {"Open","High","Low","Close"}.issubset(df.columns):
+                    df = df[["Open","High","Low","Close"]].dropna()
+                    try:
+                        df.index = pd.to_datetime(df.index)
+                    except Exception:
+                        pass
+                    return df
+                return pd.DataFrame()
 
-            # Autoscale MACD nicely
-            if macd_hist_s.notna().any():
-                max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) or 1.0
-                fig.update_yaxes(range=[-1.2*max_abs, 1.2*max_abs], row=2, col=1)
+            def finish_layout(fig, ytype="linear", ytitle="Price"):
+                fig.update_xaxes(
+                    tickformat="%b %Y",
+                    rangebreaks=[dict(bounds=["sat","mon"])],
+                    showspikes=True
+                )
+                fig.update_yaxes(type=ytype, title_text=ytitle,
+                                 tickformat="$,.0f" if ytype != "percent" else ",.1f%",
+                                 row=1, col=1, showspikes=True)
+                fig.update_yaxes(title_text="MACD", tickformat=".2f", row=2, col=1,
+                                 zeroline=True, zerolinecolor="gray")
+                fig.update_layout(
+                    height=720, hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    xaxis_rangeslider_visible=False,
+                )
 
-            finish_layout(fig, ytype=("percent" if view_mode == "% change (rebased)" else ytype), ytitle=ytitle)
-            st.plotly_chart(fig, use_container_width=True)
+            if not sel:
+                st.info("Choose a ticker above to draw the chart.")
+            else:
+                # 1) Base series
+                widen = {"6mo":"1y","1y":"2y","2y":"5y","5y":"10y","10y":"max"}
+                p = chart_period
+                s = fetch_series(sel, p)
+                while len(s) < 120 and p in widen:
+                    p = widen[p]
+                    s = fetch_series(sel, p)
 
+                if s.empty:
+                    st.info("No chartable data returned. Try a longer chart period.")
+                else:
+                    # 2) Focus window without refetching
+                    if focus != "Full":
+                        nmap = {"Last 6m": 180, "Last 1y": 365, "Last 2y": 730, "Last 5y": 1825}
+                        n = nmap.get(focus, None)
+                        if n and len(s) > n:
+                            s = s.tail(n)
+
+                    # 3) Indicators from current slice
+                    ma50s  = s.rolling(50,  min_periods=1).mean()
+                    ma200s = s.rolling(200, min_periods=1).mean()
+                    ema_fast = s.ewm(span=12, adjust=False).mean()
+                    ema_slow = s.ewm(span=26, adjust=False).mean()
+                    macd_line_s   = ema_fast - ema_slow
+                    macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                    macd_hist_s   = (macd_line_s - macd_signal_s)
+
+                    # 4) Build figure
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                        row_heights=[0.7, 0.3], vertical_spacing=0.05)
+
+                    # Candles if we can get OHLC for the slice, else line
+                    ohlc = fetch_ohlc(sel, p)
+                    if not ohlc.empty and focus != "Full":
+                        ohlc = ohlc.loc[s.index.min(): s.index.max()]
+                    have_candles = not ohlc.empty and len(ohlc) >= 20
+
+                    if view_mode == "% change (rebased)":
+                        base = s.iloc[0]
+                        y = (s / base - 1.0) * 100.0
+                        ytitle = "Return (%)"
+                        fig.add_trace(go.Scatter(x=y.index, y=y, name="% change",
+                                                 mode="lines", connectgaps=True), row=1, col=1)
+                        # Rebased MAs
+                        m50  = (ma50s / base - 1.0) * 100.0
+                        m200 = (ma200s / base - 1.0) * 100.0
+                        fig.add_trace(go.Scatter(x=m50.index,  y=m50,  name="MA50",
+                                                 mode="lines", connectgaps=True), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=m200.index, y=m200, name="MA200",
+                                                 mode="lines", connectgaps=True), row=1, col=1)
+                        ytype = "linear"   # percentage axis is linear
+                    else:
+                        if have_candles:
+                            fig.add_trace(go.Candlestick(
+                                x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+                                low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
+                            ), row=1, col=1)
+                        else:
+                            fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close",
+                                                     mode="lines", connectgaps=True), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",
+                                                 mode="lines", connectgaps=True), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200",
+                                                 mode="lines", connectgaps=True), row=1, col=1)
+                        ytitle = "Price"
+                        ytype  = "log" if view_mode == "Log price" else "linear"
+
+                    # MACD with colored histogram
+                    colors = np.where(macd_hist_s >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
+                    fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s,
+                                         name="Hist", marker_color=colors), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,
+                                             name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s,
+                                             name="Signal",mode="lines", connectgaps=True), row=2, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+
+                    # Autoscale MACD nicely
+                    if macd_hist_s.notna().any():
+                        max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) or 1.0
+                        fig.update_yaxes(range=[-1.2*max_abs, 1.2*max_abs], row=2, col=1)
+
+                    finish_layout(fig, ytype=("percent" if view_mode == "% change (rebased)" else ytype),
+                                  ytitle=ytitle)
+                    st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Export ----------
         st.subheader("Download Results")
