@@ -1,3 +1,4 @@
+# scanner.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,8 +9,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # =========================
-# Password protection (Streamlit Secrets)
+# App & Password
 # =========================
+st.set_page_config(page_title="StockPeers Screener", layout="wide")
+
 def check_password():
     def password_entered():
         expected = st.secrets.get("password", {}).get("app_password")
@@ -35,15 +38,10 @@ def check_password():
         st.stop()
 
 check_password()
-
-# =========================
-# App Title
-# =========================
-st.set_page_config(page_title="StockPeers Screener", layout="wide")
 st.title("📊 StockPeers Screener")
 
 # =========================
-# Data helpers
+# Helpers
 # =========================
 @st.cache_data(show_spinner=False)
 def load_sp500_symbols():
@@ -53,7 +51,6 @@ def load_sp500_symbols():
 
 @st.cache_data(show_spinner=False)
 def download_prices(tickers, period="1y"):
-    """Adjusted close prices in wide format (index=date, columns=tickers)."""
     px = yf.download(tickers, period=period, auto_adjust=True, progress=False)
     if isinstance(px, pd.DataFrame) and "Close" in px.columns:
         px = px["Close"]
@@ -75,7 +72,7 @@ def moving_average(prices: pd.DataFrame, window: int) -> pd.DataFrame:
     return prices.rolling(window).mean()
 
 def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int) -> dict:
-    """Golden/Death crosses in last `lookback` rows (per ticker), index-aligned."""
+    """Golden/Death crosses in last `lookback` rows (per ticker)."""
     res = {}
     for t in short_ma.columns.intersection(long_ma.columns):
         s = short_ma[t].dropna()
@@ -87,9 +84,9 @@ def recent_crosses(short_ma: pd.DataFrame, long_ma: pd.DataFrame, lookback: int)
         if s_aligned.empty or l_aligned.empty:
             res[t] = None
             continue
-        window = max(2, int(lookback) + 1)
-        s_recent = s_aligned.tail(window)
-        l_recent = l_aligned.tail(window)
+        w = max(2, int(lookback) + 1)
+        s_recent = s_aligned.tail(w)
+        l_recent = l_aligned.tail(w)
         if len(s_recent) < 2 or len(l_recent) < 2:
             res[t] = None
             continue
@@ -135,7 +132,7 @@ def fetch_fundamentals(tickers):
     return pd.DataFrame(rows).set_index("Ticker")
 
 # =========================
-# Sidebar Controls
+# Sidebar
 # =========================
 st.sidebar.header("Filters")
 
@@ -170,12 +167,20 @@ if use_fundamentals:
     dy_min = st.sidebar.slider("Dividend Yield (%, min)", 0.0, 15.0, 0.0, step=0.1)
     beta_min, beta_max = st.sidebar.slider("Beta range", -1.0, 4.0, (0.0, 2.0), step=0.1)
 
+# ---- Scoring & Ranking ----
+st.sidebar.subheader("Scoring & Ranking")
+enable_rank = st.sidebar.checkbox("Enable ranking / composite score", value=True)
+w_rsi   = st.sidebar.slider("Weight: RSI sweet spot", 0.0, 3.0, 1.0, 0.1)
+w_ma    = st.sidebar.slider("Weight: Trend vs MAs",   0.0, 3.0, 1.0, 0.1)
+w_macd  = st.sidebar.slider("Weight: MACD momentum",  0.0, 3.0, 1.0, 0.1)
+w_cross = st.sidebar.slider("Weight: Golden/Death boost", 0.0, 3.0, 0.5, 0.1)
+top_n   = st.sidebar.number_input("Show Top N", min_value=1, max_value=100, value=25, step=1)
+
 run = st.sidebar.button("Run Scan")
 
-# ============================================
-# Run the scan only when button is pressed
-# Persist outputs in st.session_state["scan"]
-# ============================================
+# =========================
+# Run Scan
+# =========================
 if run:
     with st.spinner("Fetching S&P 500 prices and calculating indicators..."):
         prices = download_prices(sp500_tickers, period=period)
@@ -184,7 +189,7 @@ if run:
             st.stop()
 
         rsi14 = rsi_wilder(prices, period=14)
-        ma50 = moving_average(prices, 50)
+        ma50  = moving_average(prices, 50)
         ma200 = moving_average(prices, 200)
         macd_line, macd_signal, macd_hist = macd(prices)
 
@@ -192,12 +197,12 @@ if run:
         latest = pd.DataFrame({
             "Price": prices_filled.iloc[-1],
             "RSI14": rsi14.iloc[-1],
-            "MA50": ma50.iloc[-1],
+            "MA50":  ma50.iloc[-1],
             "MA200": ma200.iloc[-1],
         }).dropna()
 
+        # --- base filter mask ---
         filt = latest["RSI14"].between(rsi_min, rsi_max)
-
         if price_vs_ma50 != "Any":
             filt &= (latest["Price"] > latest["MA50"]) if price_vs_ma50 == "Above" else (latest["Price"] < latest["MA50"])
         if price_vs_ma200 != "Any":
@@ -219,9 +224,50 @@ if run:
             macd_mask = macd_mask.reindex(latest.index).fillna(False)
             filt &= macd_mask
 
-        results = latest[filt].sort_index()
+        # ---------- Ranked composite score ----------
+        def z(s: pd.Series) -> pd.Series:
+            return (s - s.mean()) / (s.std(ddof=0) + 1e-9)
 
-        # Fundamentals (optional)
+        if enable_rank and len(latest) > 0:
+            price_last = prices_filled.iloc[-1].reindex(latest.index)
+            rsi_last   = rsi14.iloc[-1].reindex(latest.index)
+            ma50_last  = ma50.iloc[-1].reindex(latest.index)
+            ma200_last = ma200.iloc[-1].reindex(latest.index)
+            macd_hist_last = macd_hist.iloc[-1].reindex(latest.index).fillna(0.0)
+
+            rsi_sweet = -(rsi_last - 50.0).abs()
+
+            trend50  = (price_last - ma50_last)  / ma50_last.replace(0, np.nan)
+            trend200 = (price_last - ma200_last) / ma200_last.replace(0, np.nan)
+            trend_vs_mas = trend50.fillna(0.0) + trend200.fillna(0.0)
+
+            macd_momo = macd_hist_last
+
+            cross_for_score = recent_crosses(ma50, ma200, lookback=60)
+            cross_boost = pd.Series(0.0, index=latest.index)
+            for t in cross_boost.index:
+                v = cross_for_score.get(t)
+                if v == "Golden":
+                    cross_boost.loc[t] = 1.0
+                elif v == "Death":
+                    cross_boost.loc[t] = -1.0
+
+            score = (
+                w_rsi   * z(rsi_sweet)   +
+                w_ma    * z(trend_vs_mas) +
+                w_macd  * z(macd_momo)   +
+                w_cross * z(cross_boost)
+            )
+
+            latest_scored = latest.copy()
+            latest_scored["Score"] = score
+            results = latest_scored[filt].sort_values("Score", ascending=False)
+            if len(results) > top_n:
+                results = results.head(int(top_n))
+        else:
+            results = latest[filt].sort_index()
+
+        # Fundamentals (optional) AFTER scoring/filtering
         if use_fundamentals and len(results) > 0:
             fundamentals_df = fetch_fundamentals(results.index.tolist())
             fund_mask = pd.Series(True, index=fundamentals_df.index)
@@ -232,63 +278,145 @@ if run:
             fund_mask &= fundamentals_df["Beta"].between(beta_min, beta_max).fillna(False)
             results = results.join(fundamentals_df[fund_mask], how="inner")
 
-        # Score (simple composite)
-        def z(x): return (x - x.mean()) / (x.std(ddof=0) + 1e-9)
-        if len(results) > 0:
-            rsi_sweet = - (results["RSI14"] - 50).abs()
-            trend_pts = (results["Price"] > results["MA50"]).astype(int) + (results["Price"] > results["MA200"]).astype(int)
-            macd_boost = pd.Series(0.0, index=results.index)
-            try:
-                macd_boost = macd_hist.iloc[-1].reindex(results.index).fillna(0.0)
-            except Exception:
-                pass
-            results["Score"] = z(rsi_sweet) + z(trend_pts) + z(macd_boost)
-            results = results.sort_values("Score", ascending=False)
-
-        # Persist for later UI interactions
         st.session_state["scan"] = {
             "results": results,
             "period": period,
         }
 
 # =========================
-# Render results (from state if available)
+# Render results (safe)
 # =========================
 scan = st.session_state.get("scan")
 
 if scan is None or scan.get("results") is None:
     st.info("Set your filters in the sidebar and click **Run Scan**.")
 
-    # Safe expander BEFORE a scan: no crash, just guidance
+    # Safe expander BEFORE a scan
     with st.expander("Open full interactive chart"):
         st.info("Run a scan first to enable charting.")
 
 else:
     results = scan["results"]
-    period = scan["period"]
+    period  = scan["period"]
 
     st.success(f"Found {len(results)} match(es).")
     if len(results) == 0:
         st.info("No matches. Loosen filters and try again (wider RSI, MA = Any, longer lookbacks).")
     else:
-        # (your existing results formatting / dataframe display)
-        if "MarketCap" in results.columns:
-            results = results.copy()
-            if "MarketCap ($B)" not in results.columns:
-                results["MarketCap ($B)"] = results["MarketCap"].map(lambda x: float(x) / 1e9 if pd.notna(x) else np.nan).round(2)
-            base_cols = ["Score"] if "Score" in results.columns else []
-            first_cols = base_cols + ["Price", "RSI14", "MA50", "MA200"]
-            extras = [c for c in ["MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in results.columns]
-            results = results[first_cols + extras]
-        st.dataframe(results, use_container_width=True)
+        # Pretty table
+        tbl = results.copy()
+        if "MarketCap" in tbl.columns:
+            tbl["MarketCap ($B)"] = tbl["MarketCap"].map(billions).round(2)
+        keep = [c for c in ["Score", "Price", "RSI14", "MA50", "MA200", "MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in tbl.columns]
+        st.dataframe(tbl[keep] if keep else tbl, use_container_width=True)
 
-        # ----------------- CHART EXPANDER (now safe because 'results' exists) -----------------
+        # ----------------- CHART EXPANDER -----------------
         with st.expander("Open full interactive chart"):
             sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
+            chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
 
-            # >>> put your latest chart block here (the robust one with period selector / fallback)
-            # (If you used my last version, paste that chart code here unchanged.)
-        # -----------------------------------------------------------------------
+            def fetch_ohlc(ticker, per, auto_adjust=False):
+                interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
+                df = yf.download(ticker, period=per, interval=interval, auto_adjust=auto_adjust, progress=False)
+                try:
+                    df.index = pd.to_datetime(df.index)
+                except Exception:
+                    pass
+                return df
+
+            def finish_layout(fig):
+                fig.update_xaxes(
+                    tickformat="%b %Y",
+                    rangebreaks=[dict(bounds=["sat", "mon"])],
+                    showspikes=True
+                )
+                fig.update_yaxes(title_text="Price", tickformat="$,.0f", row=1, col=1, showspikes=True)
+                fig.update_yaxes(title_text="MACD",  tickformat=".2f",  row=2, col=1, zeroline=True, zerolinecolor="gray")
+                fig.update_layout(
+                    height=720, hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    xaxis_rangeslider_visible=False,
+                )
+                fig.update_traces(marker_opacity=0.35, selector=dict(type="bar"))
+
+            if sel:
+                widen = {"6mo": "1y", "1y": "2y", "2y": "5y", "5y": "10y", "10y": "max"}
+                p = chart_period
+                ohlc = fetch_ohlc(sel, p, auto_adjust=False)
+                while len(ohlc) < 120 and p in widen:
+                    p = widen[p]
+                    ohlc = fetch_ohlc(sel, p, auto_adjust=False)
+
+                have_ohlc = set(["Open", "High", "Low", "Close"]).issubset(ohlc.columns)
+                if have_ohlc:
+                    ohlc = ohlc[["Open", "High", "Low", "Close"]].dropna()
+
+                if have_ohlc and len(ohlc) >= 20:
+                    close = ohlc["Close"]
+                    ma50s  = close.rolling(50,  min_periods=1).mean()
+                    ma200s = close.rolling(200, min_periods=1).mean()
+
+                    ema_fast = close.ewm(span=12, adjust=False).mean()
+                    ema_slow = close.ewm(span=26, adjust=False).mean()
+                    macd_line_s   = ema_fast - ema_slow
+                    macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                    macd_hist_s   = (macd_line_s - macd_signal_s).dropna()
+
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                        row_heights=[0.7, 0.3], vertical_spacing=0.05)
+
+                    fig.add_trace(go.Candlestick(
+                        x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+                        low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
+                    ), row=1, col=1)
+
+                    fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",  mode="lines", connectgaps=True), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200", mode="lines", connectgaps=True), row=1, col=1)
+
+                    fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,   name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal",mode="lines", connectgaps=True), row=2, col=1)
+                    fig.add_trace(go.Bar(    x=macd_hist_s.index,   y=macd_hist_s,   name="Hist"),                       row=2, col=1)
+
+                    max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) if len(macd_hist_s) else 1.0
+                    r = 1.2 * max_abs if max_abs > 0 else 1.0
+                    fig.update_yaxes(range=[-r, r], row=2, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+
+                    finish_layout(fig)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                else:
+                    adj = fetch_ohlc(sel, p, auto_adjust=True)
+                    s = (adj["Close"] if "Close" in adj.columns else adj.get("Adj Close", pd.Series(dtype=float))).dropna()
+                    if s.empty or len(s) < 20:
+                        st.info("Data is sparse for this ticker. Try a longer chart period (e.g., 2y/5y/max).")
+                    else:
+                        ma50s  = s.rolling(50,  min_periods=1).mean()
+                        ma200s = s.rolling(200, min_periods=1).mean()
+                        ema_fast = s.ewm(span=12, adjust=False).mean()
+                        ema_slow = s.ewm(span=26, adjust=False).mean()
+                        macd_line_s   = ema_fast - ema_slow
+                        macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
+                        macd_hist_s   = (macd_line_s - macd_signal_s).dropna()
+
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                            row_heights=[0.7, 0.3], vertical_spacing=0.05)
+
+                        fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close", mode="lines", connectgaps=True), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",  mode="lines", connectgaps=True), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200", mode="lines", connectgaps=True), row=1, col=1)
+
+                        fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,   name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
+                        fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s, name="Signal",mode="lines", connectgaps=True), row=2, col=1)
+                        fig.add_trace(go.Bar(    x=macd_hist_s.index,   y=macd_hist_s,   name="Hist"),                       row=2, col=1)
+
+                        max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) if len(macd_hist_s) else 1.0
+                        r = 1.2 * max_abs if max_abs > 0 else 1.0
+                        fig.update_yaxes(range=[-r, r], row=2, col=1)
+                        fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+
+                        finish_layout(fig)
+                        st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Export ----------
         st.subheader("Download Results")
