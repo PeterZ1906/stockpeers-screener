@@ -51,12 +51,39 @@ def load_sp500_symbols():
 
 @st.cache_data(show_spinner=False)
 def download_prices(tickers, period="1y"):
-    px = yf.download(tickers, period=period, auto_adjust=True, progress=False)
-    if isinstance(px, pd.DataFrame) and "Close" in px.columns:
-        px = px["Close"]
-    if isinstance(px, pd.Series):
-        px = px.to_frame()
-    return px.dropna(how="all", axis=1)
+    """
+    Returns a wide DataFrame indexed by date with columns=tickers, values=Adjusted Close.
+    Handles both single and multiple tickers and unwraps MultiIndex columns.
+    """
+    df = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+
+    # Single ticker → simple frame with "Close" column (already adjusted)
+    if isinstance(df, pd.DataFrame) and not isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns:
+            out = df["Close"].to_frame()
+        elif "Adj Close" in df.columns:
+            out = df["Adj Close"].to_frame()
+        else:
+            out = df.select_dtypes(include=[np.number]).iloc[:, :1]
+        out.columns = [tickers] if isinstance(tickers, str) else out.columns
+        return out
+
+    # MultiIndex (multiple tickers) → unwrap to Close/Adj Close level
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = df.columns.get_level_values(0)
+        if "Close" in set(lvl0):
+            out = df["Close"]
+        elif "Adj Close" in set(lvl0):
+            out = df["Adj Close"]
+        else:
+            # fallback: first numeric level
+            first = lvl0.unique()[0]
+            out = df[first]
+        out.columns = [str(c) for c in out.columns]  # plain ticker names
+        out = out.dropna(how="all", axis=1)
+        return out
+
+    return pd.DataFrame()
 
 def rsi_wilder(prices: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     delta = prices.diff()
@@ -235,14 +262,18 @@ if run:
             ma200_last = ma200.iloc[-1].reindex(latest.index)
             macd_hist_last = macd_hist.iloc[-1].reindex(latest.index).fillna(0.0)
 
+            # 1) RSI sweet spot (closer to 50 is better)
             rsi_sweet = -(rsi_last - 50.0).abs()
 
+            # 2) Trend vs MAs: % above MA50 + % above MA200
             trend50  = (price_last - ma50_last)  / ma50_last.replace(0, np.nan)
             trend200 = (price_last - ma200_last) / ma200_last.replace(0, np.nan)
             trend_vs_mas = trend50.fillna(0.0) + trend200.fillna(0.0)
 
+            # 3) MACD momentum (histogram)
             macd_momo = macd_hist_last
 
+            # 4) Golden/Death boost
             cross_for_score = recent_crosses(ma50, ma200, lookback=60)
             cross_boost = pd.Series(0.0, index=latest.index)
             for t in cross_boost.index:
@@ -303,12 +334,15 @@ else:
     if len(results) == 0:
         st.info("No matches. Loosen filters and try again (wider RSI, MA = Any, longer lookbacks).")
     else:
-        # Pretty table
+        # Pretty table (+ Rank)
         tbl = results.copy()
         if "MarketCap" in tbl.columns:
             tbl["MarketCap ($B)"] = tbl["MarketCap"].map(billions).round(2)
-        keep = [c for c in ["Score", "Price", "RSI14", "MA50", "MA200", "MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in tbl.columns]
-        st.dataframe(tbl[keep] if keep else tbl, use_container_width=True)
+        if "Score" in tbl.columns:
+            tbl.insert(0, "Rank", tbl["Score"].rank(ascending=False, method="dense").astype(int))
+        cols = [c for c in ["Rank", "Score", "Price", "RSI14", "MA50", "MA200",
+                            "MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in tbl.columns]
+        st.dataframe(tbl[cols] if cols else tbl, use_container_width=True)
 
         # ----------------- CHART EXPANDER -----------------
         with st.expander("Open full interactive chart"):
@@ -340,6 +374,7 @@ else:
                 fig.update_traces(marker_opacity=0.35, selector=dict(type="bar"))
 
             if sel:
+                # auto-widen to get enough bars
                 widen = {"6mo": "1y", "1y": "2y", "2y": "5y", "5y": "10y", "10y": "max"}
                 p = chart_period
                 ohlc = fetch_ohlc(sel, p, auto_adjust=False)
