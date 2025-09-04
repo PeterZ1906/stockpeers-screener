@@ -342,7 +342,7 @@ else:
                             "MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in tbl.columns]
         st.dataframe(tbl[cols] if cols else tbl, use_container_width=True)
 
-        # ----------------- CHART EXPANDER (better UX) -----------------
+        # ----------------- CHART EXPANDER (Price + Volume + RSI + MACD + Cross markers) -----------------
         with st.expander("Open full interactive chart"):
             sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
             chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
@@ -379,32 +379,41 @@ else:
                     pass
                 return s
 
-            def fetch_ohlc(ticker, per):
-                """Optional OHLC for candles."""
+            def fetch_ohlcv(ticker, per):
+                """Optional OHLCV for candles & volume (NOT auto-adjusted)."""
                 interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
                 df = yf.download(ticker, period=per, interval=interval, auto_adjust=False, progress=False)
-                if isinstance(df, pd.DataFrame) and {"Open","High","Low","Close"}.issubset(df.columns):
-                    df = df[["Open","High","Low","Close"]].dropna()
-                    try:
-                        df.index = pd.to_datetime(df.index)
-                    except Exception:
-                        pass
-                    return df
+                if isinstance(df, pd.DataFrame):
+                    cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+                    if cols:
+                        df = df[cols].dropna()
+                        try:
+                            df.index = pd.to_datetime(df.index)
+                        except Exception:
+                            pass
+                        return df
                 return pd.DataFrame()
 
-            def finish_layout(fig, ytype="linear", ytitle="Price"):
+            def finish_layout(fig, ytype="linear", ytitle_price="Price"):
+                # Price axes
+                fig.update_yaxes(type=ytype, title_text=ytitle_price,
+                                 tickformat="$,.0f" if ytype != "percent" else ",.1f%",
+                                 row=1, col=1, showspikes=True)
+                # Volume axes
+                fig.update_yaxes(title_text="Volume", row=2, col=1, tickformat=",.0f")
+                # RSI axes
+                fig.update_yaxes(title_text="RSI(14)", row=3, col=1, range=[0, 100])
+                # MACD axes
+                fig.update_yaxes(title_text="MACD", tickformat=".2f", row=4, col=1,
+                                 zeroline=True, zerolinecolor="gray")
+
                 fig.update_xaxes(
                     tickformat="%b %Y",
                     rangebreaks=[dict(bounds=["sat","mon"])],
                     showspikes=True
                 )
-                fig.update_yaxes(type=ytype, title_text=ytitle,
-                                 tickformat="$,.0f" if ytype != "percent" else ",.1f%",
-                                 row=1, col=1, showspikes=True)
-                fig.update_yaxes(title_text="MACD", tickformat=".2f", row=2, col=1,
-                                 zeroline=True, zerolinecolor="gray")
                 fig.update_layout(
-                    height=720, hovermode="x unified",
+                    height=880, hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                     xaxis_rangeslider_visible=False,
                 )
@@ -430,25 +439,36 @@ else:
                         if n and len(s) > n:
                             s = s.tail(n)
 
-                    # 3) Indicators from current slice
+                    # Indicators from current slice
                     ma50s  = s.rolling(50,  min_periods=1).mean()
                     ma200s = s.rolling(200, min_periods=1).mean()
+                    rsi14s = rsi_wilder(s.to_frame(), 14).iloc[:, 0]  # series
                     ema_fast = s.ewm(span=12, adjust=False).mean()
                     ema_slow = s.ewm(span=26, adjust=False).mean()
                     macd_line_s   = ema_fast - ema_slow
                     macd_signal_s = macd_line_s.ewm(span=9, adjust=False).mean()
                     macd_hist_s   = (macd_line_s - macd_signal_s)
 
-                    # 4) Build figure
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                        row_heights=[0.7, 0.3], vertical_spacing=0.05)
+                    # Cross markers (within current window)
+                    crosses_local = (ma50s > ma200s) & (ma50s.shift(1) <= ma200s.shift(1))
+                    golden_dates = crosses_local[crosses_local].index
+                    crosses_local_dn = (ma50s < ma200s) & (ma50s.shift(1) >= ma200s.shift(1))
+                    death_dates = crosses_local_dn[crosses_local_dn].index
 
-                    # Candles if we can get OHLC for the slice, else line
-                    ohlc = fetch_ohlc(sel, p)
-                    if not ohlc.empty and focus != "Full":
-                        ohlc = ohlc.loc[s.index.min(): s.index.max()]
-                    have_candles = not ohlc.empty and len(ohlc) >= 20
+                    # OHLCV for candles & volume (trim to focus)
+                    ohlcv = fetch_ohlcv(sel, p)
+                    if not ohlcv.empty and focus != "Full":
+                        ohlcv = ohlcv.loc[s.index.min(): s.index.max()]
+                    have_candles = (not ohlcv.empty) and {"Open","High","Low","Close"}.issubset(ohlcv.columns)
+                    have_volume  = (not ohlcv.empty) and ("Volume" in ohlcv.columns)
 
+                    # 3) Build figure (4 rows: Price, Volume, RSI, MACD)
+                    fig = make_subplots(
+                        rows=4, cols=1, shared_xaxes=True,
+                        row_heights=[0.55, 0.15, 0.15, 0.15], vertical_spacing=0.03
+                    )
+
+                    # --- Row 1: Price ---
                     if view_mode == "% change (rebased)":
                         base = s.iloc[0]
                         y = (s / base - 1.0) * 100.0
@@ -462,40 +482,95 @@ else:
                                                  mode="lines", connectgaps=True), row=1, col=1)
                         fig.add_trace(go.Scatter(x=m200.index, y=m200, name="MA200",
                                                  mode="lines", connectgaps=True), row=1, col=1)
-                        ytype = "linear"   # percentage axis is linear
+                        # Cross markers (use s for y even in rebased → they still show relative locations)
+                        if len(golden_dates):
+                            fig.add_trace(go.Scatter(
+                                x=golden_dates, y=s.reindex(golden_dates),
+                                mode="markers", name="Golden Cross",
+                                marker_symbol="triangle-up", marker_color="limegreen", marker_size=10
+                            ), row=1, col=1)
+                        if len(death_dates):
+                            fig.add_trace(go.Scatter(
+                                x=death_dates, y=s.reindex(death_dates),
+                                mode="markers", name="Death Cross",
+                                marker_symbol="triangle-down", marker_color="crimson", marker_size=10
+                            ), row=1, col=1)
+                        ytype = "linear"
                     else:
                         if have_candles:
                             fig.add_trace(go.Candlestick(
-                                x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
-                                low=ohlc["Low"], close=ohlc["Close"], name="OHLC"
+                                x=ohlcv.index, open=ohlcv["Open"], high=ohlcv["High"],
+                                low=ohlcv["Low"], close=ohlcv["Close"], name="OHLC"
                             ), row=1, col=1)
+                            price_for_markers = ohlcv["Close"]
                         else:
                             fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close",
                                                      mode="lines", connectgaps=True), row=1, col=1)
+                            price_for_markers = s
                         fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",
                                                  mode="lines", connectgaps=True), row=1, col=1)
                         fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200",
                                                  mode="lines", connectgaps=True), row=1, col=1)
+                        # Cross markers
+                        if len(golden_dates):
+                            fig.add_trace(go.Scatter(
+                                x=golden_dates, y=price_for_markers.reindex(golden_dates),
+                                mode="markers", name="Golden Cross",
+                                marker_symbol="triangle-up", marker_color="limegreen", marker_size=10
+                            ), row=1, col=1)
+                        if len(death_dates):
+                            fig.add_trace(go.Scatter(
+                                x=death_dates, y=price_for_markers.reindex(death_dates),
+                                mode="markers", name="Death Cross",
+                                marker_symbol="triangle-down", marker_color="crimson", marker_size=10
+                            ), row=1, col=1)
                         ytitle = "Price"
                         ytype  = "log" if view_mode == "Log price" else "linear"
 
-                    # MACD with colored histogram
-                    colors = np.where(macd_hist_s >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
-                    fig.add_trace(go.Bar(x=macd_hist_s.index, y=macd_hist_s,
-                                         name="Hist", marker_color=colors), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,
-                                             name="MACD",  mode="lines", connectgaps=True), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s,
-                                             name="Signal",mode="lines", connectgaps=True), row=2, col=1)
-                    fig.add_hline(y=0, line_width=1, line_color="gray", row=2, col=1)
+                    # --- Row 2: Volume ---
+                    if have_volume:
+                        v = ohlcv["Volume"]
+                        # Color bars green if close >= open; else red
+                        up = (ohlcv["Close"] >= ohlcv["Open"]).reindex(v.index).fillna(False)
+                        vol_colors = np.where(up, "rgba(0,150,0,0.6)", "rgba(200,0,0,0.6)")
+                        fig.add_trace(go.Bar(x=v.index, y=v, name="Volume", marker_color=vol_colors), row=2, col=1)
+                    else:
+                        # no volume available → show a faint baseline
+                        fig.add_trace(go.Bar(x=s.index, y=np.zeros(len(s)), name="Volume"), row=2, col=1)
 
-                    # Autoscale MACD nicely
-                    if macd_hist_s.notna().any():
-                        max_abs = float(np.nanmax(np.abs(macd_hist_s.values))) or 1.0
-                        fig.update_yaxes(range=[-1.2*max_abs, 1.2*max_abs], row=2, col=1)
+                    # --- Row 3: RSI ---
+                    fig.add_trace(go.Scatter(x=rsi14s.index, y=rsi14s, name="RSI(14)",
+                                             mode="lines", line=dict(color="#888")), row=3, col=1)
+                    # Shaded 30–70 zone + lines
+                    fig.add_hrect(y0=30, y1=70, line_width=0, fillcolor="rgba(200,200,200,0.15)", row=3, col=1)
+                    fig.add_hline(y=30, line_width=1, line_color="crimson", row=3, col=1)
+                    fig.add_hline(y=70, line_width=1, line_color="seagreen", row=3, col=1)
+
+                    # --- Row 4: MACD with safe, colored histogram (NaN-proof) ---
+                    hist_plot = macd_hist_s.fillna(0.0)
+                    colors = np.where(hist_plot >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
+                    fig.add_trace(go.Bar(x=hist_plot.index, y=hist_plot,
+                                         name="Hist", marker_color=colors), row=4, col=1)
+                    fig.add_trace(go.Scatter(x=macd_line_s.index,   y=macd_line_s,
+                                             name="MACD",  mode="lines", connectgaps=True), row=4, col=1)
+                    fig.add_trace(go.Scatter(x=macd_signal_s.index, y=macd_signal_s,
+                                             name="Signal",mode="lines", connectgaps=True), row=4, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=4, col=1)
+
+                    # MACD autoscale safely (Series or DataFrame)
+                    vals = macd_hist_s
+                    if isinstance(vals, pd.DataFrame):
+                        vals = vals.stack()
+                    vals = np.asarray(vals, dtype="float64")
+                    vals = vals[np.isfinite(vals)]
+                    if vals.size:
+                        max_abs = float(np.nanmax(np.abs(vals)))
+                        if max_abs == 0:
+                            max_abs = 1.0
+                        fig.update_yaxes(range=[-1.2 * max_abs, 1.2 * max_abs], row=4, col=1)
 
                     finish_layout(fig, ytype=("percent" if view_mode == "% change (rebased)" else ytype),
-                                  ytitle=ytitle)
+                                  ytitle_price=ytitle)
                     st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Export ----------
