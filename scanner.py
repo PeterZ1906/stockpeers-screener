@@ -53,11 +53,11 @@ def load_sp500_symbols():
 def download_prices(tickers, period="1y"):
     """
     Returns a wide DataFrame indexed by date with columns=tickers, values=Adjusted Close.
-    Handles both single and multiple tickers and unwraps MultiIndex columns.
+    Handles single & multi ticker responses from yfinance.
     """
     df = yf.download(tickers, period=period, auto_adjust=True, progress=False)
 
-    # Single ticker → simple frame with "Close" column (already adjusted)
+    # Single ticker → simple frame with Close
     if isinstance(df, pd.DataFrame) and not isinstance(df.columns, pd.MultiIndex):
         if "Close" in df.columns:
             out = df["Close"].to_frame()
@@ -68,7 +68,7 @@ def download_prices(tickers, period="1y"):
         out.columns = [tickers] if isinstance(tickers, str) else out.columns
         return out
 
-    # MultiIndex (multiple tickers) → unwrap to Close/Adj Close level
+    # MultiIndex (multiple tickers) → unwrap level0
     if isinstance(df.columns, pd.MultiIndex):
         lvl0 = df.columns.get_level_values(0)
         if "Close" in set(lvl0):
@@ -76,9 +76,8 @@ def download_prices(tickers, period="1y"):
         elif "Adj Close" in set(lvl0):
             out = df["Adj Close"]
         else:
-            first = lvl0.unique()[0]
-            out = df[first]
-        out.columns = [str(c) for c in out.columns]  # plain ticker names
+            out = df[lvl0.unique()[0]]
+        out.columns = [str(c) for c in out.columns]
         out = out.dropna(how="all", axis=1)
         return out
 
@@ -462,41 +461,67 @@ else:
                         row_heights=[0.55, 0.15, 0.15, 0.15], vertical_spacing=0.03
                     )
 
-                    # --- Row 1: Price ---
+                    # --- Row 1: Price / %Change / Log ---
                     if view_mode == "% change (rebased)":
-                        base = s.iloc[0]
+                        # Rebase to 0% at start
+                        base = float(s.iloc[0])
                         y = (s / base - 1.0) * 100.0
-                        fig.add_trace(go.Scatter(x=y.index, y=y, name="% change",
-                                                 mode="lines", connectgaps=True), row=1, col=1)
-                        m50  = (ma50s / base - 1.0) * 100.0
+
+                        fig.add_trace(go.Scatter(
+                            x=y.index, y=y, name="% change", mode="lines", connectgaps=True,
+                            line=dict(color="#1f77b4", width=2.5), cliponaxis=False
+                        ), row=1, col=1)
+
+                        m50  = (ma50s  / base - 1.0) * 100.0
                         m200 = (ma200s / base - 1.0) * 100.0
-                        fig.add_trace(go.Scatter(x=m50.index,  y=m50,  name="MA50",
-                                                 mode="lines", connectgaps=True), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=m200.index, y=m200, name="MA200",
-                                                 mode="lines", connectgaps=True), row=1, col=1)
-                        # Cross markers (use actual s for y just to position visually)
+
+                        fig.add_trace(go.Scatter(
+                            x=m50.index, y=m50, name="MA50", mode="lines", connectgaps=True,
+                            line=dict(color="#66b3ff", width=2), cliponaxis=False
+                        ), row=1, col=1)
+
+                        fig.add_trace(go.Scatter(
+                            x=m200.index, y=m200, name="MA200", mode="lines", connectgaps=True,
+                            line=dict(color="#ff7f7f", width=2), cliponaxis=False
+                        ), row=1, col=1)
+
+                        # Cross markers (use price for positioning)
                         if len(golden_dates):
                             fig.add_trace(go.Scatter(
                                 x=golden_dates, y=s.reindex(golden_dates),
                                 mode="markers", name="Golden Cross",
-                                marker_symbol="triangle-up", marker_color="limegreen", marker_size=10
+                                marker_symbol="triangle-up", marker_color="limegreen", marker_size=10,
+                                cliponaxis=False
                             ), row=1, col=1)
                         if len(death_dates):
                             fig.add_trace(go.Scatter(
                                 x=death_dates, y=s.reindex(death_dates),
                                 mode="markers", name="Death Cross",
-                                marker_symbol="triangle-down", marker_color="crimson", marker_size=10
+                                marker_symbol="triangle-down", marker_color="crimson", marker_size=10,
+                                cliponaxis=False
                             ), row=1, col=1)
-                        # Smart y-range for % mode
+
+                        # Robust y-range: symmetric around 0%
                         stack_price = pd.concat([y, m50, m200], axis=0).dropna()
-                        if not stack_price.empty:
-                            y_min, y_max = float(stack_price.min()), float(stack_price.max())
-                        else:
+                        if stack_price.empty:
                             y_min, y_max = -10.0, 10.0
-                        pad = max(1.0, (y_max - y_min) * 0.05)
-                        fig.update_yaxes(range=[y_min - pad, y_max + pad], row=1, col=1)
+                        else:
+                            max_abs = float(np.nanmax(np.abs(stack_price.values)))
+                            if not np.isfinite(max_abs) or max_abs == 0:
+                                max_abs = 5.0
+                            max_abs = min(max_abs * 1.15 + 1.0, 100.0)
+                            y_min, y_max = -max_abs, max_abs
+                        fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
+
+                        # Zero baseline
+                        fig.add_hline(y=0, line_width=1, line_color="gray", row=1, col=1)
+
                         ytype = "linear"
                         price_title = "Return (%)"
+
+                        # Hint if all NaN
+                        if y.dropna().empty:
+                            st.info("No non-NaN values for % change in the selected window; try a longer period.")
 
                     else:
                         if have_candles:
@@ -525,6 +550,7 @@ else:
                                 mode="markers", name="Death Cross",
                                 marker_symbol="triangle-down", marker_color="crimson", marker_size=10
                             ), row=1, col=1)
+
                         # Smart y-range for actual-price mode
                         stack_price = pd.concat([price_for_markers, ma50s, ma200s], axis=0).dropna()
                         if not stack_price.empty:
