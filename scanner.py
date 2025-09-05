@@ -214,7 +214,7 @@ if run:
             st.error("Could not download price data. Please try again.")
             st.stop()
 
-        rsi14 = rsi_wilder(prices, period=14)
+        rsi14 = rsi_wilder(pd.DataFrame(prices), period=14)
         ma50  = moving_average(prices, 50)
         ma200 = moving_average(prices, 200)
         macd_line, macd_signal, macd_hist = macd(prices)
@@ -342,7 +342,7 @@ else:
                             "MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in tbl.columns]
         st.dataframe(tbl[cols] if cols else tbl, use_container_width=True)
 
-        # ----------------- CHART EXPANDER (Price + Volume + RSI + MACD + Cross markers) -----------------
+        # ----------------- CHART EXPANDER -----------------
         with st.expander("Open full interactive chart"):
             sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
             chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
@@ -395,18 +395,13 @@ else:
                 return pd.DataFrame()
 
             def finish_layout(fig, ytype="linear", ytitle_price="Price"):
-                # Price axes
                 fig.update_yaxes(type=ytype, title_text=ytitle_price,
                                  tickformat="$,.0f" if ytype != "percent" else ",.1f%",
                                  row=1, col=1, showspikes=True)
-                # Volume axes
                 fig.update_yaxes(title_text="Volume", row=2, col=1, tickformat=",.0f")
-                # RSI axes
                 fig.update_yaxes(title_text="RSI(14)", row=3, col=1, range=[0, 100])
-                # MACD axes
                 fig.update_yaxes(title_text="MACD", tickformat=".2f", row=4, col=1,
                                  zeroline=True, zerolinecolor="gray")
-
                 fig.update_xaxes(
                     tickformat="%b %Y",
                     rangebreaks=[dict(bounds=["sat","mon"])],
@@ -421,14 +416,13 @@ else:
             if not sel:
                 st.info("Choose a ticker above to draw the chart.")
             else:
-                # 1) Base series
+                # 1) Base series with widening if too few points
                 widen = {"6mo":"1y","1y":"2y","2y":"5y","5y":"10y","10y":"max"}
                 p = chart_period
                 s = fetch_series(sel, p)
                 while len(s) < 120 and p in widen:
                     p = widen[p]
                     s = fetch_series(sel, p)
-
                 if s.empty:
                     st.info("No chartable data returned. Try a longer chart period.")
                 else:
@@ -442,9 +436,7 @@ else:
                     # Indicators from current slice
                     ma50s  = s.rolling(50,  min_periods=1).mean()
                     ma200s = s.rolling(200, min_periods=1).mean()
-                    # Ensure RSI input is always a DataFrame
-                    rsi14s = rsi_wilder(pd.DataFrame(s), 14).iloc[:, 0]
-
+                    rsi14s = rsi_wilder(pd.DataFrame(s), 14).iloc[:, 0]   # pandas compatible
                     ema_fast = s.ewm(span=12, adjust=False).mean()
                     ema_slow = s.ewm(span=26, adjust=False).mean()
                     macd_line_s   = ema_fast - ema_slow
@@ -452,8 +444,8 @@ else:
                     macd_hist_s   = (macd_line_s - macd_signal_s)
 
                     # Cross markers (within current window)
-                    crosses_local = (ma50s > ma200s) & (ma50s.shift(1) <= ma200s.shift(1))
-                    golden_dates = crosses_local[crosses_local].index
+                    crosses_local_up = (ma50s > ma200s) & (ma50s.shift(1) <= ma200s.shift(1))
+                    golden_dates = crosses_local_up[crosses_local_up].index
                     crosses_local_dn = (ma50s < ma200s) & (ma50s.shift(1) >= ma200s.shift(1))
                     death_dates = crosses_local_dn[crosses_local_dn].index
 
@@ -474,17 +466,15 @@ else:
                     if view_mode == "% change (rebased)":
                         base = s.iloc[0]
                         y = (s / base - 1.0) * 100.0
-                        ytitle = "Return (%)"
                         fig.add_trace(go.Scatter(x=y.index, y=y, name="% change",
                                                  mode="lines", connectgaps=True), row=1, col=1)
-                        # Rebased MAs
                         m50  = (ma50s / base - 1.0) * 100.0
                         m200 = (ma200s / base - 1.0) * 100.0
                         fig.add_trace(go.Scatter(x=m50.index,  y=m50,  name="MA50",
                                                  mode="lines", connectgaps=True), row=1, col=1)
                         fig.add_trace(go.Scatter(x=m200.index, y=m200, name="MA200",
                                                  mode="lines", connectgaps=True), row=1, col=1)
-                        # Cross markers (use s for y even in rebased → they still show relative locations)
+                        # Cross markers (use actual s for y just to position visually)
                         if len(golden_dates):
                             fig.add_trace(go.Scatter(
                                 x=golden_dates, y=s.reindex(golden_dates),
@@ -497,7 +487,17 @@ else:
                                 mode="markers", name="Death Cross",
                                 marker_symbol="triangle-down", marker_color="crimson", marker_size=10
                             ), row=1, col=1)
+                        # Smart y-range for % mode
+                        stack_price = pd.concat([y, m50, m200], axis=0).dropna()
+                        if not stack_price.empty:
+                            y_min, y_max = float(stack_price.min()), float(stack_price.max())
+                        else:
+                            y_min, y_max = -10.0, 10.0
+                        pad = max(1.0, (y_max - y_min) * 0.05)
+                        fig.update_yaxes(range=[y_min - pad, y_max + pad], row=1, col=1)
                         ytype = "linear"
+                        price_title = "Return (%)"
+
                     else:
                         if have_candles:
                             fig.add_trace(go.Candlestick(
@@ -513,7 +513,6 @@ else:
                                                  mode="lines", connectgaps=True), row=1, col=1)
                         fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200",
                                                  mode="lines", connectgaps=True), row=1, col=1)
-                        # Cross markers
                         if len(golden_dates):
                             fig.add_trace(go.Scatter(
                                 x=golden_dates, y=price_for_markers.reindex(golden_dates),
@@ -526,29 +525,37 @@ else:
                                 mode="markers", name="Death Cross",
                                 marker_symbol="triangle-down", marker_color="crimson", marker_size=10
                             ), row=1, col=1)
-                        ytitle = "Price"
+                        # Smart y-range for actual-price mode
+                        stack_price = pd.concat([price_for_markers, ma50s, ma200s], axis=0).dropna()
+                        if not stack_price.empty:
+                            y_min, y_max = float(stack_price.min()), float(stack_price.max())
+                            if y_max == y_min:
+                                y_min -= 1.0
+                                y_max += 1.0
+                        else:
+                            y_min, y_max = 0.0, 1.0
+                        pad = max((y_max - y_min) * 0.08, 0.5)
+                        fig.update_yaxes(range=[y_min - pad, y_max + pad], row=1, col=1)
                         ytype  = "log" if view_mode == "Log price" else "linear"
+                        price_title = "Price"
 
                     # --- Row 2: Volume ---
                     if have_volume:
                         v = ohlcv["Volume"]
-                        # Color bars green if close >= open; else red
                         up = (ohlcv["Close"] >= ohlcv["Open"]).reindex(v.index).fillna(False)
                         vol_colors = np.where(up, "rgba(0,150,0,0.6)", "rgba(200,0,0,0.6)")
                         fig.add_trace(go.Bar(x=v.index, y=v, name="Volume", marker_color=vol_colors), row=2, col=1)
                     else:
-                        # no volume available → show a faint baseline
                         fig.add_trace(go.Bar(x=s.index, y=np.zeros(len(s)), name="Volume"), row=2, col=1)
 
                     # --- Row 3: RSI ---
                     fig.add_trace(go.Scatter(x=rsi14s.index, y=rsi14s, name="RSI(14)",
                                              mode="lines", line=dict(color="#888")), row=3, col=1)
-                    # Shaded 30–70 zone + lines
                     fig.add_hrect(y0=30, y1=70, line_width=0, fillcolor="rgba(200,200,200,0.15)", row=3, col=1)
                     fig.add_hline(y=30, line_width=1, line_color="crimson", row=3, col=1)
                     fig.add_hline(y=70, line_width=1, line_color="seagreen", row=3, col=1)
 
-                    # --- Row 4: MACD with safe, colored histogram (NaN-proof) ---
+                    # --- Row 4: MACD (colored histogram) ---
                     hist_plot = macd_hist_s.fillna(0.0)
                     colors = np.where(hist_plot >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
                     fig.add_trace(go.Bar(x=hist_plot.index, y=hist_plot,
@@ -559,7 +566,7 @@ else:
                                              name="Signal",mode="lines", connectgaps=True), row=4, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=4, col=1)
 
-                    # MACD autoscale safely (Series or DataFrame)
+                    # MACD autoscale safely
                     vals = macd_hist_s
                     if isinstance(vals, pd.DataFrame):
                         vals = vals.stack()
@@ -571,8 +578,14 @@ else:
                             max_abs = 1.0
                         fig.update_yaxes(range=[-1.2 * max_abs, 1.2 * max_abs], row=4, col=1)
 
-                    finish_layout(fig, ytype=("percent" if view_mode == "% change (rebased)" else ytype),
-                                  ytitle_price=ytitle)
+                    # Final layout & axes formatting
+                    if view_mode == "% change (rebased)":
+                        finish_layout(fig, ytype="linear", ytitle_price=price_title)
+                        fig.update_yaxes(title_text="Return (%)", tickformat=",.1f%", row=1, col=1)
+                    else:
+                        finish_layout(fig, ytype=ytype, ytitle_price=price_title)
+                        fig.update_yaxes(title_text="Price", tickformat="$,.0f", row=1, col=1)
+
                     st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Export ----------
