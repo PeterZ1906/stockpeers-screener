@@ -442,10 +442,8 @@ else:
                     # Indicators from current slice
                     ma50s  = s.rolling(50,  min_periods=1).mean()
                     ma200s = s.rolling(200, min_periods=1).mean()
-                    ss = s.copy()
-                    if ss.name is None:
-                        ss.name = "close"
-                    rsi14s = rsi_wilder(pd.DataFrame(ss), 14).iloc[:, 0]
+                    # Ensure RSI input is always a DataFrame
+                    rsi14s = rsi_wilder(pd.DataFrame(s), 14).iloc[:, 0]
 
                     ema_fast = s.ewm(span=12, adjust=False).mean()
                     ema_slow = s.ewm(span=26, adjust=False).mean()
