@@ -329,7 +329,7 @@ else:
 
     st.success(f"Found {len(results)} match(es).")
     if len(results) == 0:
-        st.info("No matches. Loosen filters and try again (wider RSI, MA = Any, longer lookbacks).")
+        st.info("No matches. Loosen filters (wider RSI, MA=Any, etc.) and try again.")
     else:
         # Pretty table (+ Rank)
         tbl = results.copy()
@@ -351,7 +351,7 @@ else:
                 ["Price (actual)", "% change (rebased)", "Log price"],
                 index=0,
                 horizontal=True,
-                help="Switch to % or Log for long horizons to make moves visible."
+                help="Use % change to compare moves; Log helps long horizons."
             )
             focus = st.selectbox(
                 "Focus window",
@@ -379,7 +379,7 @@ else:
                 return s
 
             def fetch_ohlcv(ticker, per):
-                """Optional OHLCV for candles & volume (NOT auto-adjusted)."""
+                """Optional OHLCV for volume only; price panel is line-only."""
                 interval = "1d" if per in ["6mo", "1y", "2y"] else "1wk"
                 df = yf.download(ticker, period=per, interval=interval, auto_adjust=False, progress=False)
                 if isinstance(df, pd.DataFrame):
@@ -401,11 +401,11 @@ else:
                 fig.update_yaxes(title_text="RSI(14)", row=3, col=1, range=[0, 100])
                 fig.update_yaxes(title_text="MACD", tickformat=".2f", row=4, col=1,
                                  zeroline=True, zerolinecolor="gray")
-                fig.update_xaxes(
-                    tickformat="%b %Y",
-                    rangebreaks=[dict(bounds=["sat","mon"])],
-                    showspikes=True
-                )
+                # no range breaks to avoid edge cases collapsing the axis
+                fig.update_xaxes(rangebreaks=[], showspikes=True, row=1, col=1)
+                fig.update_xaxes(rangebreaks=[], showspikes=True, row=2, col=1)
+                fig.update_xaxes(rangebreaks=[], showspikes=True, row=3, col=1)
+                fig.update_xaxes(rangebreaks=[], showspikes=True, row=4, col=1)
                 fig.update_layout(
                     height=880, hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -448,11 +448,10 @@ else:
                     crosses_local_dn = (ma50s < ma200s) & (ma50s.shift(1) >= ma200s.shift(1))
                     death_dates = crosses_local_dn[crosses_local_dn].index
 
-                    # OHLCV for candles & volume (trim to focus)
+                    # OHLCV for volume (price panel is line-only)
                     ohlcv = fetch_ohlcv(sel, p)
                     if not ohlcv.empty and focus != "Full":
                         ohlcv = ohlcv.loc[s.index.min(): s.index.max()]
-                    have_candles = (not ohlcv.empty) and {"Open","High","Low","Close"}.issubset(ohlcv.columns)
                     have_volume  = (not ohlcv.empty) and ("Volume" in ohlcv.columns)
 
                     # 3) Build figure (4 rows: Price, Volume, RSI, MACD)
@@ -461,9 +460,8 @@ else:
                         row_heights=[0.55, 0.15, 0.15, 0.15], vertical_spacing=0.03
                     )
 
-                    # --- Row 1: Price / %Change / Log ---
+                    # --- Row 1: Price / %Change / Log (LINE-ONLY for robustness) ---
                     if view_mode == "% change (rebased)":
-                        # Rebase to 0% at start
                         base = float(s.iloc[0])
                         y = (s / base - 1.0) * 100.0
 
@@ -479,90 +477,80 @@ else:
                             x=m50.index, y=m50, name="MA50", mode="lines", connectgaps=True,
                             line=dict(color="#66b3ff", width=2), cliponaxis=False
                         ), row=1, col=1)
-
                         fig.add_trace(go.Scatter(
                             x=m200.index, y=m200, name="MA200", mode="lines", connectgaps=True,
                             line=dict(color="#ff7f7f", width=2), cliponaxis=False
                         ), row=1, col=1)
 
-                        # Cross markers (use price for positioning)
+                        # Markers positioned by actual price
                         if len(golden_dates):
                             fig.add_trace(go.Scatter(
                                 x=golden_dates, y=s.reindex(golden_dates),
-                                mode="markers", name="Golden Cross",
-                                marker_symbol="triangle-up", marker_color="limegreen", marker_size=10,
-                                cliponaxis=False
-                            ), row=1, col=1)
-                        if len(death_dates):
-                            fig.add_trace(go.Scatter(
-                                x=death_dates, y=s.reindex(death_dates),
-                                mode="markers", name="Death Cross",
-                                marker_symbol="triangle-down", marker_color="crimson", marker_size=10,
-                                cliponaxis=False
-                            ), row=1, col=1)
-
-                        # Robust y-range: symmetric around 0%
-                        stack_price = pd.concat([y, m50, m200], axis=0).dropna()
-                        if stack_price.empty:
-                            y_min, y_max = -10.0, 10.0
-                        else:
-                            max_abs = float(np.nanmax(np.abs(stack_price.values)))
-                            if not np.isfinite(max_abs) or max_abs == 0:
-                                max_abs = 5.0
-                            max_abs = min(max_abs * 1.15 + 1.0, 100.0)
-                            y_min, y_max = -max_abs, max_abs
-                        fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
-
-                        # Zero baseline
-                        fig.add_hline(y=0, line_width=1, line_color="gray", row=1, col=1)
-
-                        ytype = "linear"
-                        price_title = "Return (%)"
-
-                        # Hint if all NaN
-                        if y.dropna().empty:
-                            st.info("No non-NaN values for % change in the selected window; try a longer period.")
-
-                    else:
-                        if have_candles:
-                            fig.add_trace(go.Candlestick(
-                                x=ohlcv.index, open=ohlcv["Open"], high=ohlcv["High"],
-                                low=ohlcv["Low"], close=ohlcv["Close"], name="OHLC"
-                            ), row=1, col=1)
-                            price_for_markers = ohlcv["Close"]
-                        else:
-                            fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close",
-                                                     mode="lines", connectgaps=True), row=1, col=1)
-                            price_for_markers = s
-                        fig.add_trace(go.Scatter(x=ma50s.index,  y=ma50s,  name="MA50",
-                                                 mode="lines", connectgaps=True), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=ma200s.index, y=ma200s, name="MA200",
-                                                 mode="lines", connectgaps=True), row=1, col=1)
-                        if len(golden_dates):
-                            fig.add_trace(go.Scatter(
-                                x=golden_dates, y=price_for_markers.reindex(golden_dates),
                                 mode="markers", name="Golden Cross",
                                 marker_symbol="triangle-up", marker_color="limegreen", marker_size=10
                             ), row=1, col=1)
                         if len(death_dates):
                             fig.add_trace(go.Scatter(
-                                x=death_dates, y=price_for_markers.reindex(death_dates),
+                                x=death_dates, y=s.reindex(death_dates),
                                 mode="markers", name="Death Cross",
                                 marker_symbol="triangle-down", marker_color="crimson", marker_size=10
                             ), row=1, col=1)
 
-                        # Smart y-range for actual-price mode
-                        stack_price = pd.concat([price_for_markers, ma50s, ma200s], axis=0).dropna()
-                        if not stack_price.empty:
-                            y_min, y_max = float(stack_price.min()), float(stack_price.max())
+                        # symmetric y-range around 0%
+                        stack = pd.concat([y, m50, m200], axis=0).dropna()
+                        if stack.empty:
+                            y_min, y_max = -10, 10
+                        else:
+                            max_abs = float(np.nanmax(np.abs(stack.values)))
+                            if not np.isfinite(max_abs) or max_abs == 0:
+                                max_abs = 5.0
+                            max_abs = min(max_abs * 1.15 + 1.0, 100.0)
+                            y_min, y_max = -max_abs, max_abs
+                        fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
+                        fig.add_hline(y=0, line_width=1, line_color="gray", row=1, col=1)
+
+                        ytype = "linear"
+                        price_title = "Return (%)"
+
+                    else:
+                        # Always draw a line for price — no candles
+                        fig.add_trace(go.Scatter(
+                            x=s.index, y=s, name="Adj Close", mode="lines", connectgaps=True
+                        ), row=1, col=1)
+
+                        fig.add_trace(go.Scatter(
+                            x=ma50s.index, y=ma50s, name="MA50", mode="lines", connectgaps=True
+                        ), row=1, col=1)
+                        fig.add_trace(go.Scatter(
+                            x=ma200s.index, y=ma200s, name="MA200", mode="lines", connectgaps=True
+                        ), row=1, col=1)
+
+                        if len(golden_dates):
+                            fig.add_trace(go.Scatter(
+                                x=golden_dates, y=s.reindex(golden_dates),
+                                mode="markers", name="Golden Cross",
+                                marker_symbol="triangle-up", marker_color="limegreen", marker_size=10
+                            ), row=1, col=1)
+                        if len(death_dates):
+                            fig.add_trace(go.Scatter(
+                                x=death_dates, y=s.reindex(death_dates),
+                                mode="markers", name="Death Cross",
+                                marker_symbol="triangle-down", marker_color="crimson", marker_size=10
+                            ), row=1, col=1)
+
+                        # y-range from visible series
+                        stack = pd.concat([s, ma50s, ma200s], axis=0).dropna()
+                        if stack.empty:
+                            y_min, y_max = 0.0, 1.0
+                        else:
+                            y_min, y_max = float(stack.min()), float(stack.max())
                             if y_max == y_min:
                                 y_min -= 1.0
                                 y_max += 1.0
-                        else:
-                            y_min, y_max = 0.0, 1.0
                         pad = max((y_max - y_min) * 0.08, 0.5)
                         fig.update_yaxes(range=[y_min - pad, y_max + pad], row=1, col=1)
-                        ytype  = "log" if view_mode == "Log price" else "linear"
+
+                        ytype = "log" if view_mode == "Log price" else "linear"
                         price_title = "Price"
 
                     # --- Row 2: Volume ---
@@ -572,6 +560,7 @@ else:
                         vol_colors = np.where(up, "rgba(0,150,0,0.6)", "rgba(200,0,0,0.6)")
                         fig.add_trace(go.Bar(x=v.index, y=v, name="Volume", marker_color=vol_colors), row=2, col=1)
                     else:
+                        # keep the row but zero bars if not available
                         fig.add_trace(go.Bar(x=s.index, y=np.zeros(len(s)), name="Volume"), row=2, col=1)
 
                     # --- Row 3: RSI ---
@@ -604,7 +593,7 @@ else:
                             max_abs = 1.0
                         fig.update_yaxes(range=[-1.2 * max_abs, 1.2 * max_abs], row=4, col=1)
 
-                    # Final layout & axes formatting
+                    # Final layout & axes formatting (no range breaks)
                     if view_mode == "% change (rebased)":
                         finish_layout(fig, ytype="linear", ytitle_price=price_title)
                         fig.update_yaxes(title_text="Return (%)", tickformat=",.1f%", row=1, col=1)
