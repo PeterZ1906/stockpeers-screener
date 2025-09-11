@@ -4,40 +4,32 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, timedelta
-
-import plotly.graph_objs as go
 from plotly.subplots import make_subplots
+import plotly.graph_objs as go
 
 
-# ----------------------------- #
+# ─────────────────────────────────────────────────────────────
 # Utilities & Indicators
-# ----------------------------- #
+# ─────────────────────────────────────────────────────────────
 
-def rsi_wilder(df_or_s, length=14):
+def rsi_wilder(df_or_s, length: int = 14) -> pd.Series:
     """
-    Wilder's RSI on a Series or single-column DataFrame.
-    Returns a DataFrame if a DataFrame is passed; otherwise a Series.
+    Wilder's RSI. Always returns a Series.
+    Accepts either a Series or a single-column DataFrame.
     """
     if isinstance(df_or_s, pd.DataFrame):
         s = df_or_s.iloc[:, 0].astype(float).copy()
-        wrap_df = True
     else:
-        s = df_or_s.astype(float).copy()
-        wrap_df = False
+        s = pd.Series(df_or_s, copy=True).astype(float)
 
     delta = s.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
 
-    # Wilder smoothing via EWM(alpha = 1/length)
     roll_up = up.ewm(alpha=1/length, adjust=False).mean()
     roll_down = down.ewm(alpha=1/length, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
+    rs = roll_up / roll_down.replace(0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
-
-    if wrap_df:
-        return pd.DataFrame(rsi)
     return rsi
 
 
@@ -45,15 +37,33 @@ def rsi_wilder(df_or_s, length=14):
 def get_sp500_tickers():
     """Scrape S&P 500 tickers and cache."""
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        )
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        # Remove known non-yahoo symbols if any
-        tickers = [t for t in tickers if isinstance(t, str) and t.strip() != ""]
+        tickers = [t for t in tickers if isinstance(t, str) and t.strip()]
         return sorted(list(set(tickers)))
     except Exception:
-        # Fallback small list in case scraping fails
-        return sorted(list(set(["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "XOM", "UNH"])))
+        # Fallback (in case scraping fails)
+        return sorted(
+            list(
+                set(
+                    [
+                        "AAPL",
+                        "MSFT",
+                        "NVDA",
+                        "AMZN",
+                        "META",
+                        "GOOGL",
+                        "BRK-B",
+                        "JPM",
+                        "XOM",
+                        "UNH",
+                    ]
+                )
+            )
+        )
 
 
 def latest_cross_flags(ma_fast: pd.Series, ma_slow: pd.Series, lookback: int):
@@ -61,10 +71,8 @@ def latest_cross_flags(ma_fast: pd.Series, ma_slow: pd.Series, lookback: int):
     Detect MA cross in the last `lookback` bars.
     Returns (golden_cross_recent, death_cross_recent).
     """
-    # Cross when fast crosses above slow
     cross_up = (ma_fast > ma_slow) & (ma_fast.shift(1) <= ma_slow.shift(1))
     cross_dn = (ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1))
-
     gc = cross_up.rolling(lookback, min_periods=1).max().fillna(0).iloc[-1] == 1
     dc = cross_dn.rolling(lookback, min_periods=1).max().fillna(0).iloc[-1] == 1
     return bool(gc), bool(dc)
@@ -97,31 +105,26 @@ def score_trend(price, ma50, ma200):
 
 def score_macd_momentum(line_last, sig_last, price_series):
     """
-    Normalize MACD momentum by the recent volatility so units don't explode.
-    returns score in 0..1 via tanh squashing to keep it stable.
+    Normalize MACD momentum by recent volatility; squash to 0..1 via tanh.
     """
     if any(np.isnan([line_last, sig_last])) or price_series.isna().all():
         return 0.0
     mom = float(line_last - sig_last)
     vol = float(price_series.pct_change().std())
-    if vol <= 0 or np.isnan(vol):
-        z = mom
-    else:
-        z = mom / (vol * 5.0)
-    return float((np.tanh(z) + 1) / 2.0)  # map -1..1 -> 0..1
+    z = mom if (vol <= 0 or np.isnan(vol)) else mom / (vol * 5.0)
+    return float((np.tanh(z) + 1) / 2.0)
 
 
 @st.cache_data(show_spinner=True, ttl=15 * 60)
 def download_prices(tickers, period="1y"):
     """
     Download adjusted close for all tickers with yfinance (grouped).
-    Returns dict ticker -> Series (Adj Close or Close).
+    Returns dict ticker -> Series (Close/Adj Close).
     """
     data = {}
-    if len(tickers) == 0:
+    if not tickers:
         return data
 
-    # yfinance wants space-separated tickers for multi-sym download
     try:
         df = yf.download(
             tickers=" ".join(tickers),
@@ -136,7 +139,6 @@ def download_prices(tickers, period="1y"):
         df = None
 
     if df is None or df.empty:
-        # fallback: loop (slower but robust)
         for t in tickers:
             try:
                 d = yf.download(t, period=period, auto_adjust=True, progress=False)
@@ -150,60 +152,57 @@ def download_prices(tickers, period="1y"):
                 pass
         return data
 
-    # Multi-ticker frame
     if isinstance(df.columns, pd.MultiIndex):
-        # df[ticker]['Close'] (adjusted because auto_adjust)
         for t in tickers:
             try:
                 s = df[t]["Close"].dropna()
                 s.index = pd.to_datetime(s.index)
                 data[t] = s.astype(float)
             except Exception:
-                # sometimes some tickers missing
                 pass
     else:
-        # Single ticker
         s = df.get("Close", df.get("Adj Close"))
         if s is not None:
             s = s.dropna()
             s.index = pd.to_datetime(s.index)
-            # Unknown which ticker exactly, but we can only return 1
             data[tickers[0]] = s.astype(float)
 
     return data
 
 
-# ----------------------------- #
+# ─────────────────────────────────────────────────────────────
 # Password Gate (optional)
-# ----------------------------- #
+# ─────────────────────────────────────────────────────────────
 
 def check_password():
-    # If no password set in secrets, allow
     expected = st.secrets.get("password", {}).get("app_password")
     if not expected:
         return True
 
     def pass_entered():
-        if st.session_state.get("password_input", "") == expected:
-            st.session_state["password_ok"] = True
-        else:
-            st.session_state["password_ok"] = False
+        st.session_state["password_ok"] = (
+            st.session_state.get("password_input", "") == expected
+        )
 
     if "password_ok" not in st.session_state:
-        st.text_input("Enter password", type="password", on_change=pass_entered, key="password_input")
+        st.text_input(
+            "Enter password", type="password", on_change=pass_entered, key="password_input"
+        )
         st.stop()
 
     if not st.session_state["password_ok"]:
         st.error("Incorrect password")
-        st.text_input("Enter password", type="password", on_change=pass_entered, key="password_input")
+        st.text_input(
+            "Enter password", type="password", on_change=pass_entered, key="password_input"
+        )
         st.stop()
 
     return True
 
 
-# ----------------------------- #
+# ─────────────────────────────────────────────────────────────
 # UI
-# ----------------------------- #
+# ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="StockPeers Screener", layout="wide", page_icon="📈")
 
@@ -213,12 +212,10 @@ if check_password():
     # Sidebar filters
     st.sidebar.subheader("Filters")
 
-    # Universe (S&P 500 only per your request)
     sp_tickers = get_sp500_tickers()
     st.sidebar.caption(f"S&P 500 universe loaded: **{len(sp_tickers)}** tickers")
 
     price_period = st.sidebar.selectbox("Price history period (for metrics)", ["1y", "2y"], index=0)
-
     rsi_min, rsi_max = st.sidebar.slider("RSI Range (14)", 0, 100, (30, 70))
 
     pv50 = st.sidebar.selectbox("Price vs 50-day MA", ["Any", "Above", "Below"], index=0)
@@ -239,24 +236,21 @@ if check_password():
         disabled=not macd_enable,
     )
     macd_look = st.sidebar.number_input(
-        "Lookback days for MACD cross",
-        min_value=2, max_value=60, value=10, step=1, disabled=not macd_enable
+        "Lookback days for MACD cross", min_value=2, max_value=60, value=10, step=1, disabled=not macd_enable
     )
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Scoring & Ranking")
-    use_score = st.sidebar.checkbox("Enable ranking / composite score", value=True,
-                                    help="If off, rows are unranked and unsorted.")
+    use_score = st.sidebar.checkbox("Enable ranking / composite score", value=True)
     w_rsi = st.sidebar.slider("Weight: RSI sweet spot", 0.0, 2.0, 1.0, 0.05)
     w_trend = st.sidebar.slider("Weight: Trend vs MAs", 0.0, 2.0, 1.0, 0.05)
     w_macd = st.sidebar.slider("Weight: MACD momentum", 0.0, 2.0, 1.0, 0.05)
     w_cross = st.sidebar.slider("Weight: Golden/Death boost", -1.0, 2.0, 0.5, 0.05)
     top_n = st.sidebar.number_input("Show Top N", 5, 50, 25, 1)
 
-    # ----------------------------- #
+    # ─────────────────────────────────────────────────────────
     # Compute metrics
-    # ----------------------------- #
-
+    # ─────────────────────────────────────────────────────────
     with st.spinner("Downloading price data…"):
         price_map = download_prices(sp_tickers, period=price_period)
 
@@ -264,9 +258,10 @@ if check_password():
     for t, s in price_map.items():
         if s.size < 60:
             continue
+
         ma50 = s.rolling(50, min_periods=1).mean()
         ma200 = s.rolling(200, min_periods=1).mean()
-        rsi14 = rsi_wilder(s, 14)
+        rsi14 = rsi_wilder(s, 14).astype(float)  # <— FIXED: always pass Series
         m_line, m_sig, m_hist = macd(s)
 
         # Recent cross flags (50 vs 200)
@@ -279,7 +274,7 @@ if check_password():
         last_macd = float(m_line.iloc[-1])
         last_sig = float(m_sig.iloc[-1])
 
-        # Row-level filters
+        # Filters
         if not (rsi_min <= last_rsi <= rsi_max):
             continue
         if pv50 == "Above" and not (last_price > last_ma50):
@@ -290,15 +285,12 @@ if check_password():
             continue
         if pv200 == "Below" and not (last_price < last_ma200):
             continue
-
         if cross_req:
             if cx_type == "Golden" and not gc_recent:
                 continue
             if cx_type == "Death" and not dc_recent:
                 continue
-
         if macd_enable:
-            # cross detection in lookback
             cross_up = (m_line > m_sig) & (m_line.shift(1) <= m_sig.shift(1))
             cross_dn = (m_line < m_sig) & (m_line.shift(1) >= m_sig.shift(1))
             bull_recent = bool(cross_up.rolling(int(macd_look), min_periods=1).max().iloc[-1] == 1)
@@ -317,22 +309,20 @@ if check_password():
         rsi_score = score_rsi_sweet(last_rsi)
         trend_score = score_trend(last_price, last_ma50, last_ma200)
         macd_score = score_macd_momentum(last_macd, last_sig, s)
-        cross_boost = 0.0
-        if gc_recent:
-            cross_boost += 1.0
-        if dc_recent:
-            cross_boost -= 1.0
+        cross_boost = (1.0 if gc_recent else 0.0) - (1.0 if dc_recent else 0.0)
 
         composite = (w_rsi * rsi_score) + (w_trend * trend_score) + (w_macd * macd_score) + (w_cross * cross_boost)
 
-        rows.append({
-            "Ticker": t,
-            "Score": composite,
-            "Price": last_price / 100.0 if last_price > 5000 else last_price,  # prevent scientific fmt
-            "RSI(14)": last_rsi,
-            "MA50": last_ma50,
-            "MA200": last_ma200,
-        })
+        rows.append(
+            {
+                "Ticker": t,
+                "Score": composite,
+                "Price": last_price / 100.0 if last_price > 5000 else last_price,  # avoid sci-notation
+                "RSI(14)": last_rsi,
+                "MA50": last_ma50,
+                "MA200": last_ma200,
+            }
+        )
 
     results = pd.DataFrame(rows).set_index("Ticker")
     if results.empty:
@@ -345,23 +335,18 @@ if check_password():
     st.success(f"Found {len(results)} match(es).")
     st.dataframe(results.head(int(top_n)), use_container_width=True)
 
-    # ----------------------------- #
-    # Chart (robust version)
-    # ----------------------------- #
-
+    # ─────────────────────────────────────────────────────────
+    # Chart (robust)
+    # ─────────────────────────────────────────────────────────
     with st.expander("Open full interactive chart"):
         sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
-
-        chart_period = st.selectbox(
-            "Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period"
-        )
-
+        chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y", "10y", "max"], index=1, key="chart_period")
         view_mode = st.radio(
             "View mode",
             ["Price (actual)", "% change (rebased)", "Log price"],
             index=0,
             horizontal=True,
-            help="Use % change to compare moves; Log helps long horizons."
+            help="Use % change to compare moves; Log helps long horizons.",
         )
 
         def fetch_series(ticker, per):
@@ -407,10 +392,9 @@ if check_password():
             if s.empty:
                 st.info("No chartable data returned. Try a longer chart period.")
             else:
-                # Indicators
                 ma50 = s.rolling(50, min_periods=1).mean()
                 ma200 = s.rolling(200, min_periods=1).mean()
-                rsi14 = rsi_wilder(s.to_frame(), 14).iloc[:, 0].astype(float)
+                rsi14 = rsi_wilder(s, 14).astype(float)  # <— FIXED
                 ema_fast = s.ewm(span=12, adjust=False).mean()
                 ema_slow = s.ewm(span=26, adjust=False).mean()
                 macd_line = (ema_fast - ema_slow).astype(float)
@@ -419,35 +403,48 @@ if check_password():
 
                 v = fetch_volume(sel, p)
                 if not v.empty:
-                    v = v.loc[s.index.min(): s.index.max()]
+                    v = v.loc[s.index.min() : s.index.max()]
                 have_volume = not v.empty
 
                 fig = make_subplots(
-                    rows=4, cols=1, shared_xaxes=True,
-                    row_heights=[0.55, 0.15, 0.15, 0.15], vertical_spacing=0.03
+                    rows=4,
+                    cols=1,
+                    shared_xaxes=True,
+                    row_heights=[0.55, 0.15, 0.15, 0.15],
+                    vertical_spacing=0.03,
                 )
 
                 if view_mode == "% change (rebased)":
                     base = float(s.iloc[0])
                     y = (s / base - 1.0) * 100.0
                     fig.add_trace(go.Scatter(x=y.index, y=y, name="% change", mode="lines"), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=ma50.index,  y=(ma50 / base - 1.0) * 100.0, name="MA50",  mode="lines"), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=ma200.index, y=(ma200 / base - 1.0) * 100.0, name="MA200", mode="lines"), row=1, col=1)
+                    fig.add_trace(
+                        go.Scatter(x=ma50.index, y=(ma50 / base - 1.0) * 100.0, name="MA50", mode="lines"), row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(x=ma200.index, y=(ma200 / base - 1.0) * 100.0, name="MA200", mode="lines"),
+                        row=1,
+                        col=1,
+                    )
                     price_title = "Return (%)"
                     ytype = "linear"
                 else:
                     fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close", mode="lines"), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=ma50.index,  y=ma50,  name="MA50",  mode="lines"), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=ma50.index, y=ma50, name="MA50", mode="lines"), row=1, col=1)
                     fig.add_trace(go.Scatter(x=ma200.index, y=ma200, name="MA200", mode="lines"), row=1, col=1)
                     price_title = "Price"
                     ytype = "log" if view_mode == "Log price" else "linear"
 
                 if have_volume:
-                    fig.add_trace(go.Bar(x=v.index, y=v, name="Volume",
-                                         marker_color="rgba(70,130,180,0.6)"), row=2, col=1)
+                    fig.add_trace(
+                        go.Bar(x=v.index, y=v, name="Volume", marker_color="rgba(70,130,180,0.6)"), row=2, col=1
+                    )
 
-                fig.add_trace(go.Scatter(x=rsi14.index, y=rsi14, name="RSI(14)", mode="lines",
-                                         line=dict(color="#666")), row=3, col=1)
+                fig.add_trace(
+                    go.Scatter(x=rsi14.index, y=rsi14, name="RSI(14)", mode="lines", line=dict(color="#666")),
+                    row=3,
+                    col=1,
+                )
                 fig.add_hrect(y0=30, y1=70, line_width=0, fillcolor="rgba(200,200,200,0.18)", row=3, col=1)
                 fig.add_hline(y=30, line_width=1, line_color="crimson", row=3, col=1)
                 fig.add_hline(y=70, line_width=1, line_color="seagreen", row=3, col=1)
@@ -455,7 +452,7 @@ if check_password():
                 hist = macd_hist.fillna(0.0)
                 colors = np.where(hist >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
                 fig.add_trace(go.Bar(x=hist.index, y=hist, name="Hist", marker_color=colors), row=4, col=1)
-                fig.add_trace(go.Scatter(x=macd_line.index,   y=macd_line,   name="MACD",  mode="lines"), row=4, col=1)
+                fig.add_trace(go.Scatter(x=macd_line.index, y=macd_line, name="MACD", mode="lines"), row=4, col=1)
                 fig.add_trace(go.Scatter(x=macd_signal.index, y=macd_signal, name="Signal", mode="lines"), row=4, col=1)
                 fig.add_hline(y=0, line_width=1, line_color="gray", row=4, col=1)
 
@@ -471,7 +468,6 @@ if check_password():
                 fig.update_yaxes(title_text="MACD", row=4, col=1)
 
                 st.plotly_chart(fig, use_container_width=True)
-
                 st.caption(
                     f"{sel} | Points: {len(s)} | Last Price: {s.iloc[-1]:.2f} | "
                     f"RSI(14): {rsi14.iloc[-1]:.1f} | MA50/MA200: {ma50.iloc[-1]:.2f} / {ma200.iloc[-1]:.2f}"
