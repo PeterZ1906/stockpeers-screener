@@ -327,19 +327,40 @@ else:
     results = scan["results"]
     period  = scan["period"]
 
+    # ---------- Table: stable, explicit column ordering ----------
     st.success(f"Found {len(results)} match(es).")
     if len(results) == 0:
         st.info("No matches. Loosen filters (wider RSI, MA=Any, etc.) and try again.")
     else:
-        # Pretty table (+ Rank)
-        tbl = results.copy()
-        if "MarketCap" in tbl.columns:
-            tbl["MarketCap ($B)"] = tbl["MarketCap"].map(billions).round(2)
-        if "Score" in tbl.columns:
-            tbl.insert(0, "Rank", tbl["Score"].rank(ascending=False, method="dense").astype(int))
-        cols = [c for c in ["Rank", "Score", "Price", "RSI14", "MA50", "MA200",
-                            "MarketCap ($B)", "PE", "DividendYield", "Beta"] if c in tbl.columns]
-        st.dataframe(tbl[cols] if cols else tbl, use_container_width=True)
+        view = results.copy()
+        # Format fundamentals (don’t let them shift core columns)
+        if "MarketCap" in view.columns:
+            view["MarketCap ($B)"] = view["MarketCap"].map(lambda x: np.nan if pd.isna(x) else float(x) / 1e9)
+
+        # Stable RSI column for display (0..100)
+        if "RSI14" in view.columns:
+            view["RSI(14)"] = view["RSI14"].clip(0, 100)
+        else:
+            view["RSI(14)"] = np.nan
+
+        # Rank if we have Score
+        if "Score" in view.columns:
+            view["Rank"] = view["Score"].rank(ascending=False, method="dense").astype(int)
+        else:
+            view["Rank"] = np.nan
+
+        display_cols = ["Rank", "Score", "Price", "RSI(14)", "MA50", "MA200"]
+        for extra in ["MarketCap ($B)", "PE", "DividendYield", "Beta"]:
+            if extra in view.columns:
+                display_cols.append(extra)
+
+        safe = pd.DataFrame(index=view.index)
+        for c in display_cols:
+            if c in view.columns:
+                safe[c] = view[c]
+
+        with pd.option_context("display.precision", 4):
+            st.dataframe(safe, use_container_width=True)
 
         # ----------------- CHART EXPANDER -----------------
         with st.expander("Open full interactive chart"):
@@ -415,7 +436,6 @@ else:
             if not sel:
                 st.info("Choose a ticker above to draw the chart.")
             else:
-                # 1) Base series with widening if too few points
                 widen = {"6mo":"1y","1y":"2y","2y":"5y","5y":"10y","10y":"max"}
                 p = chart_period
                 s = fetch_series(sel, p)
@@ -425,7 +445,6 @@ else:
                 if s.empty:
                     st.info("No chartable data returned. Try a longer chart period.")
                 else:
-                    # 2) Focus window without refetching
                     if focus != "Full":
                         nmap = {"Last 6m": 180, "Last 1y": 365, "Last 2y": 730, "Last 5y": 1825}
                         n = nmap.get(focus, None)
@@ -435,7 +454,7 @@ else:
                     # Indicators from current slice
                     ma50s  = s.rolling(50,  min_periods=1).mean()
                     ma200s = s.rolling(200, min_periods=1).mean()
-                    rsi14s = rsi_wilder(pd.DataFrame(s), 14).iloc[:, 0]   # pandas compatible
+                    rsi14s = rsi_wilder(pd.DataFrame(s), 14).iloc[:, 0]
                     ema_fast = s.ewm(span=12, adjust=False).mean()
                     ema_slow = s.ewm(span=26, adjust=False).mean()
                     macd_line_s   = ema_fast - ema_slow
@@ -482,7 +501,6 @@ else:
                             line=dict(color="#ff7f7f", width=2), cliponaxis=False
                         ), row=1, col=1)
 
-                        # Markers positioned by actual price
                         if len(golden_dates):
                             fig.add_trace(go.Scatter(
                                 x=golden_dates, y=s.reindex(golden_dates),
@@ -496,7 +514,6 @@ else:
                                 marker_symbol="triangle-down", marker_color="crimson", marker_size=10
                             ), row=1, col=1)
 
-                        # symmetric y-range around 0%
                         stack = pd.concat([y, m50, m200], axis=0).dropna()
                         if stack.empty:
                             y_min, y_max = -10, 10
@@ -513,7 +530,6 @@ else:
                         price_title = "Return (%)"
 
                     else:
-                        # Always draw a line for price — no candles
                         fig.add_trace(go.Scatter(
                             x=s.index, y=s, name="Adj Close", mode="lines", connectgaps=True
                         ), row=1, col=1)
@@ -538,7 +554,6 @@ else:
                                 marker_symbol="triangle-down", marker_color="crimson", marker_size=10
                             ), row=1, col=1)
 
-                        # y-range from visible series
                         stack = pd.concat([s, ma50s, ma200s], axis=0).dropna()
                         if stack.empty:
                             y_min, y_max = 0.0, 1.0
@@ -560,7 +575,6 @@ else:
                         vol_colors = np.where(up, "rgba(0,150,0,0.6)", "rgba(200,0,0,0.6)")
                         fig.add_trace(go.Bar(x=v.index, y=v, name="Volume", marker_color=vol_colors), row=2, col=1)
                     else:
-                        # keep the row but zero bars if not available
                         fig.add_trace(go.Bar(x=s.index, y=np.zeros(len(s)), name="Volume"), row=2, col=1)
 
                     # --- Row 3: RSI ---
@@ -581,7 +595,6 @@ else:
                                              name="Signal",mode="lines", connectgaps=True), row=4, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=4, col=1)
 
-                    # MACD autoscale safely
                     vals = macd_hist_s
                     if isinstance(vals, pd.DataFrame):
                         vals = vals.stack()
@@ -593,7 +606,6 @@ else:
                             max_abs = 1.0
                         fig.update_yaxes(range=[-1.2 * max_abs, 1.2 * max_abs], row=4, col=1)
 
-                    # Final layout & axes formatting (no range breaks)
                     if view_mode == "% change (rebased)":
                         finish_layout(fig, ytype="linear", ytitle_price=price_title)
                         fig.update_yaxes(title_text="Return (%)", tickformat=",.1f%", row=1, col=1)
@@ -607,12 +619,12 @@ else:
         st.subheader("Download Results")
         fmt = st.selectbox("Choose format", ["CSV", "Excel (.xlsx)"], index=0)
         if fmt == "CSV":
-            csv = results.to_csv().encode("utf-8")
+            csv = safe.to_csv().encode("utf-8")
             st.download_button("Download CSV", csv, file_name="stock_scan_results.csv", mime="text/csv")
         else:
             output = BytesIO()
             with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                results.to_excel(writer, sheet_name="Results")
+                safe.to_excel(writer, sheet_name="Results")
             st.download_button(
                 "Download Excel",
                 data=output.getvalue(),
