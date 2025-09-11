@@ -9,8 +9,19 @@ import plotly.graph_objs as go
 
 
 # ─────────────────────────────────────────────────────────────
-# Utilities & Indicators
+# Helpers & Indicators
 # ─────────────────────────────────────────────────────────────
+
+def fmt_num(x, d=2) -> str:
+    """Safely format numeric values; returns '—' for non-numbers/NaN."""
+    try:
+        xf = float(x)
+        if np.isnan(xf):
+            return "—"
+        return f"{xf:.{d}f}"
+    except Exception:
+        return "—"
+
 
 def rsi_wilder(df_or_s, length: int = 14) -> pd.Series:
     """
@@ -35,35 +46,18 @@ def rsi_wilder(df_or_s, length: int = 14) -> pd.Series:
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_sp500_tickers():
-    """Scrape S&P 500 tickers and cache."""
+    """Scrape S&P 500 tickers (cached)."""
     try:
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
         tickers = [t for t in tickers if isinstance(t, str) and t.strip()]
         return sorted(list(set(tickers)))
     except Exception:
-        # Fallback (in case scraping fails)
-        return sorted(
-            list(
-                set(
-                    [
-                        "AAPL",
-                        "MSFT",
-                        "NVDA",
-                        "AMZN",
-                        "META",
-                        "GOOGL",
-                        "BRK-B",
-                        "JPM",
-                        "XOM",
-                        "UNH",
-                    ]
-                )
-            )
-        )
+        # Fallback
+        return sorted(list(set([
+            "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "XOM", "UNH"
+        ])))
 
 
 def latest_cross_flags(ma_fast: pd.Series, ma_slow: pd.Series, lookback: int):
@@ -261,8 +255,8 @@ if check_password():
 
         ma50 = s.rolling(50, min_periods=1).mean()
         ma200 = s.rolling(200, min_periods=1).mean()
-        rsi14 = rsi_wilder(s, 14).astype(float)  # <— FIXED: always pass Series
-        m_line, m_sig, m_hist = macd(s)
+        rsi14 = rsi_wilder(s, 14).astype(float)  # <— always Series
+        m_line, m_sig, _ = macd(s)
 
         # Recent cross flags (50 vs 200)
         gc_recent, dc_recent = latest_cross_flags(ma50, ma200, lookback=int(cx_look))
@@ -317,7 +311,7 @@ if check_password():
             {
                 "Ticker": t,
                 "Score": composite,
-                "Price": last_price / 100.0 if last_price > 5000 else last_price,  # avoid sci-notation
+                "Price": last_price if last_price < 50000 else last_price / 100.0,  # avoid huge axis values
                 "RSI(14)": last_rsi,
                 "MA50": last_ma50,
                 "MA200": last_ma200,
@@ -394,7 +388,7 @@ if check_password():
             else:
                 ma50 = s.rolling(50, min_periods=1).mean()
                 ma200 = s.rolling(200, min_periods=1).mean()
-                rsi14 = rsi_wilder(s, 14).astype(float)  # <— FIXED
+                rsi14 = rsi_wilder(s, 14).astype(float)   # <— RSI from Series
                 ema_fast = s.ewm(span=12, adjust=False).mean()
                 ema_slow = s.ewm(span=26, adjust=False).mean()
                 macd_line = (ema_fast - ema_slow).astype(float)
@@ -469,6 +463,8 @@ if check_password():
 
                 st.plotly_chart(fig, use_container_width=True)
                 st.caption(
-                    f"{sel} | Points: {len(s)} | Last Price: {s.iloc[-1]:.2f} | "
-                    f"RSI(14): {rsi14.iloc[-1]:.1f} | MA50/MA200: {ma50.iloc[-1]:.2f} / {ma200.iloc[-1]:.2f}"
+                    f"{sel} | Points: {len(s)} | "
+                    f"Last Price: {fmt_num(s.iloc[-1], 2)} | "
+                    f"RSI(14): {fmt_num(rsi14.iloc[-1], 1)} | "
+                    f"MA50/MA200: {fmt_num(ma50.iloc[-1], 2)} / {fmt_num(ma200.iloc[-1], 2)}"
                 )
