@@ -221,90 +221,112 @@ if check_password():
     w_cross = st.sidebar.slider("Weight: Golden/Death boost", -1.0, 2.0, 0.5, 0.05)
     top_n = st.sidebar.number_input("Show Top N", 5, 50, 25, 1)
 
-    # ─────────────────────────────────────────────────────────
-    # Compute metrics
-    # ─────────────────────────────────────────────────────────
-    with st.spinner("Downloading price data…"):
-        price_map = download_prices(sp_tickers, period=price_period)
+    # 👉 Run Scan button
+    run_clicked = st.sidebar.button("Run Scan", type="primary", use_container_width=True)
 
-    rows = []
-    for t, s in price_map.items():
-        if s.size < 60:
-            continue
+    # Pack parameters so we can detect changes (optional: could store for reruns)
+    params = dict(
+        price_period=price_period, rsi_min=rsi_min, rsi_max=rsi_max, pv50=pv50, pv200=pv200,
+        cross_req=cross_req, cx_type=cx_type, cx_look=cx_look,
+        macd_enable=macd_enable, macd_cond=macd_cond, macd_look=macd_look,
+        use_score=use_score, w_rsi=w_rsi, w_trend=w_trend, w_macd=w_macd, w_cross=w_cross, top_n=top_n
+    )
 
-        ma50 = s.rolling(50, min_periods=1).mean()
-        ma200 = s.rolling(200, min_periods=1).mean()
-        rsi14 = rsi_wilder(s, 14).astype(float)
-        m_line, m_sig, _ = macd(s)
+    # Run scan only when clicked; store results in session
+    results = None
+    if run_clicked:
+        with st.spinner("Downloading price data & running scan…"):
+            price_map = download_prices(sp_tickers, period=price_period)
 
-        gc_recent, dc_recent = latest_cross_flags(ma50, ma200, lookback=int(cx_look))
-
-        last_price = float(s.iloc[-1])
-        last_ma50 = float(ma50.iloc[-1])
-        last_ma200 = float(ma200.iloc[-1])
-        last_rsi = float(rsi14.iloc[-1])
-        last_macd = float(m_line.iloc[-1])
-        last_sig = float(m_sig.iloc[-1])
-
-        # Filters
-        if not (rsi_min <= last_rsi <= rsi_max):
-            continue
-        if pv50 == "Above" and not (last_price > last_ma50):
-            continue
-        if pv50 == "Below" and not (last_price < last_ma50):
-            continue
-        if pv200 == "Above" and not (last_price > last_ma200):
-            continue
-        if pv200 == "Below" and not (last_price < last_ma200):
-            continue
-        if cross_req:
-            if cx_type == "Golden" and not gc_recent:
-                continue
-            if cx_type == "Death" and not dc_recent:
-                continue
-        if macd_enable:
-            cross_up = (m_line > m_sig) & (m_line.shift(1) <= m_sig.shift(1))
-            cross_dn = (m_line < m_sig) & (m_line.shift(1) >= m_sig.shift(1))
-            bull_recent = bool(cross_up.rolling(int(macd_look), min_periods=1).max().iloc[-1] == 1)
-            bear_recent = bool(cross_dn.rolling(int(macd_look), min_periods=1).max().iloc[-1] == 1)
-
-            if macd_cond == "Line > Signal" and not (last_macd > last_sig):
-                continue
-            if macd_cond == "Line < Signal" and not (last_macd < last_sig):
-                continue
-            if macd_cond == "Bullish cross (recent)" and not bull_recent:
-                continue
-            if macd_cond == "Bearish cross (recent)" and not bear_recent:
+        rows = []
+        for t, s in price_map.items():
+            if s.size < 60:
                 continue
 
-        rsi_score = score_rsi_sweet(last_rsi)
-        trend_score = score_trend(last_price, last_ma50, last_ma200)
-        macd_score = score_macd_momentum(last_macd, last_sig, s)
-        cross_boost = (1.0 if gc_recent else 0.0) - (1.0 if dc_recent else 0.0)
+            ma50 = s.rolling(50, min_periods=1).mean()
+            ma200 = s.rolling(200, min_periods=1).mean()
+            rsi14 = rsi_wilder(s, 14).astype(float)
+            m_line, m_sig, _ = macd(s)
 
-        composite = (w_rsi * rsi_score) + (w_trend * trend_score) + (w_macd * macd_score) + (w_cross * cross_boost)
+            gc_recent, dc_recent = latest_cross_flags(ma50, ma200, lookback=int(cx_look))
 
-        rows.append(
-            {
-                "Ticker": t,
-                "Score": composite,
-                "Price": last_price,
-                "RSI(14)": last_rsi,
-                "MA50": last_ma50,
-                "MA200": last_ma200,
-            }
-        )
+            last_price = float(s.iloc[-1])
+            last_ma50 = float(ma50.iloc[-1])
+            last_ma200 = float(ma200.iloc[-1])
+            last_rsi = float(rsi14.iloc[-1])
+            last_macd = float(m_line.iloc[-1])
+            last_sig = float(m_sig.iloc[-1])
 
-    results = pd.DataFrame(rows).set_index("Ticker")
-    if results.empty:
-        st.warning("No matches with current filters.")
+            # Filters
+            if not (rsi_min <= last_rsi <= rsi_max):
+                continue
+            if pv50 == "Above" and not (last_price > last_ma50):
+                continue
+            if pv50 == "Below" and not (last_price < last_ma50):
+                continue
+            if pv200 == "Above" and not (last_price > last_ma200):
+                continue
+            if pv200 == "Below" and not (last_price < last_ma200):
+                continue
+            if cross_req:
+                if cx_type == "Golden" and not gc_recent:
+                    continue
+                if cx_type == "Death" and not dc_recent:
+                    continue
+            if macd_enable:
+                cross_up = (m_line > m_sig) & (m_line.shift(1) <= m_sig.shift(1))
+                cross_dn = (m_line < m_sig) & (m_line.shift(1) >= m_sig.shift(1))
+                bull_recent = bool(cross_up.rolling(int(macd_look), min_periods=1).max().iloc[-1] == 1)
+                bear_recent = bool(cross_dn.rolling(int(macd_look), min_periods=1).max().iloc[-1] == 1)
+
+                if macd_cond == "Line > Signal" and not (last_macd > last_sig):
+                    continue
+                if macd_cond == "Line < Signal" and not (last_macd < last_sig):
+                    continue
+                if macd_cond == "Bullish cross (recent)" and not bull_recent:
+                    continue
+                if macd_cond == "Bearish cross (recent)" and not bear_recent:
+                    continue
+
+            rsi_score = score_rsi_sweet(last_rsi)
+            trend_score = score_trend(last_price, last_ma50, last_ma200)
+            macd_score = score_macd_momentum(last_macd, last_sig, s)
+            cross_boost = (1.0 if gc_recent else 0.0) - (1.0 if dc_recent else 0.0)
+
+            composite = (w_rsi * rsi_score) + (w_trend * trend_score) + (w_macd * macd_score) + (w_cross * cross_boost)
+
+            rows.append(
+                {
+                    "Ticker": t,
+                    "Score": composite,
+                    "Price": last_price,
+                    "RSI(14)": last_rsi,
+                    "MA50": last_ma50,
+                    "MA200": last_ma200,
+                }
+            )
+
+        results = pd.DataFrame(rows).set_index("Ticker")
+        st.session_state["scan_results"] = results
+        st.session_state["scan_params"] = params
+
+    # Use last results if present
+    if results is None:
+        results = st.session_state.get("scan_results")
+
+    # Display results if we have them
+    if results is None or results.empty:
+        st.info("Click **Run Scan** in the sidebar to compute results.")
         st.stop()
+
+    use_score = params["use_score"]
+    top_n = params["top_n"]
 
     if use_score:
         results = results.sort_values("Score", ascending=False)
     results.insert(0, "Rank", range(1, len(results) + 1))
 
-    # 👉 Currency formatting for table
+    # Currency formatting for table
     styler = (
         results.head(int(top_n))
         .style.format(
@@ -327,7 +349,7 @@ if check_password():
     st.dataframe(styler, use_container_width=True)
 
     # ─────────────────────────────────────────────────────────
-    # Chart (robust + currency axis)
+    # Chart (with forced axis ranges + Run Scan results)
     # ─────────────────────────────────────────────────────────
     with st.expander("Open full interactive chart"):
         sel = st.selectbox("Choose ticker", results.index.tolist(), key="chart_ticker")
@@ -405,26 +427,46 @@ if check_password():
                     vertical_spacing=0.03,
                 )
 
+                # ── PRICE PANEL ─────────────────────────────────────
                 if view_mode == "% change (rebased)":
                     base = float(s.iloc[0])
                     y = (s / base - 1.0) * 100.0
                     fig.add_trace(go.Scatter(x=y.index, y=y, name="% change", mode="lines"), row=1, col=1)
                     fig.add_trace(go.Scatter(x=ma50.index, y=(ma50 / base - 1.0) * 100.0, name="MA50", mode="lines"), row=1, col=1)
                     fig.add_trace(go.Scatter(x=ma200.index, y=(ma200 / base - 1.0) * 100.0, name="MA200", mode="lines"), row=1, col=1)
-                    price_title = "Return (%)"
-                    ytype = "linear"
-                    price_tickformat = ".1f"
-                    price_prefix = ""
-                    price_suffix = "%"
+
+                    ymin = float(np.nanmin(y))
+                    ymax = float(np.nanmax(y))
+                    if np.isfinite(ymin) and np.isfinite(ymax) and ymin != ymax:
+                        pad = 0.05 * (ymax - ymin + 1e-9)
+                        fig.update_yaxes(range=[ymin - pad, ymax + pad], row=1, col=1)
+
+                    fig.update_yaxes(
+                        title_text="Return (%)",
+                        tickformat=".1f",
+                        ticksuffix="%",
+                        row=1, col=1
+                    )
                 else:
                     fig.add_trace(go.Scatter(x=s.index, y=s, name="Adj Close", mode="lines"), row=1, col=1)
                     fig.add_trace(go.Scatter(x=ma50.index, y=ma50, name="MA50", mode="lines"), row=1, col=1)
                     fig.add_trace(go.Scatter(x=ma200.index, y=ma200, name="MA200", mode="lines"), row=1, col=1)
-                    price_title = "Price"
-                    ytype = "log" if view_mode == "Log price" else "linear"
-                    price_tickformat = ",.2f"
-                    price_prefix = "$"
-                    price_suffix = ""
+
+                    # Force a sensible linear/log range
+                    smin = float(np.nanmin(s))
+                    smax = float(np.nanmax(s))
+                    if np.isfinite(smin) and np.isfinite(smax) and smin != smax:
+                        pad = 0.05 * (smax - smin + 1e-9)
+                        fig.update_yaxes(range=[smin - pad, smax + pad], row=1, col=1)
+
+                    fig.update_yaxes(
+                        type="log" if view_mode == "Log price" else "linear",
+                        title_text="Price",
+                        tickformat=",.2f",
+                        tickprefix="$",
+                        row=1, col=1,
+                    )
+                # ──────────────────────────────────────────────────
 
                 if have_volume:
                     fig.add_trace(go.Bar(x=v.index, y=v, name="Volume", marker_color="rgba(70,130,180,0.6)"), row=2, col=1)
@@ -433,6 +475,7 @@ if check_password():
                 fig.add_hrect(y0=30, y1=70, line_width=0, fillcolor="rgba(200,200,200,0.18)", row=3, col=1)
                 fig.add_hline(y=30, line_width=1, line_color="crimson", row=3, col=1)
                 fig.add_hline(y=70, line_width=1, line_color="seagreen", row=3, col=1)
+                fig.update_yaxes(title_text="RSI(14)", row=3, col=1, range=[0, 100])
 
                 hist = macd_hist.fillna(0.0)
                 colors = np.where(hist >= 0, "rgba(0,160,0,0.6)", "rgba(200,0,0,0.6)")
@@ -440,26 +483,15 @@ if check_password():
                 fig.add_trace(go.Scatter(x=macd_line.index, y=macd_line, name="MACD", mode="lines"), row=4, col=1)
                 fig.add_trace(go.Scatter(x=macd_signal.index, y=macd_signal, name="Signal", mode="lines"), row=4, col=1)
                 fig.add_hline(y=0, line_width=1, line_color="gray", row=4, col=1)
+                fig.update_yaxes(title_text="MACD", row=4, col=1)
 
+                fig.update_yaxes(title_text="Volume", row=2, col=1, tickformat=",.0f")
                 fig.update_layout(
                     height=860,
                     hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                     xaxis_rangeslider_visible=False,
                 )
-
-                # 👉 Proper axis formatting
-                fig.update_yaxes(
-                    type=ytype,
-                    title_text=price_title,
-                    tickformat=price_tickformat,
-                    tickprefix=price_prefix,
-                    ticksuffix=price_suffix,
-                    row=1, col=1,
-                )
-                fig.update_yaxes(title_text="Volume", row=2, col=1, tickformat=",.0f")
-                fig.update_yaxes(title_text="RSI(14)", row=3, col=1, range=[0, 100])
-                fig.update_yaxes(title_text="MACD", row=4, col=1)
 
                 st.plotly_chart(fig, use_container_width=True)
                 st.caption(
