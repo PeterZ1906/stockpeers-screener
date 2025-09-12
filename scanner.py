@@ -1,109 +1,95 @@
-# StockPeers Screener (full app)
-# ------------------------------------------------------------
-# Streamlit app to screen S&P 500 by technicals (RSI, MAs, MACD) and optional fundamentals.
-# The scan only re-runs when you click "Run Scan". Selecting a ticker to chart does not
-# restart the scan. Data sources: Yahoo Finance via yfinance; S&P 500 tickers via CSV.
+# scanner.py
+# Streamlit app: StockPeers Screener (S&P 500 by default)
+# -------------------------------------------------------
+# - Technical filters: RSI range, price vs MA50/MA200, recent MA crossover, MACD
+# - Optional fundamentals: simple market-cap bounds (disabled by default)
+# - Composite score & ranking
+# - Interactive Plotly chart with Price+MA, Volume, RSI and MACD
+# - Caching for downloads; robust to yfinance MultiIndex layouts
+# -------------------------------------------------------
 
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
 
 # -----------------------------
-# Utilities & configuration
+# ---------- Utils ------------
 # -----------------------------
 
 st.set_page_config(page_title="StockPeers Screener", layout="wide")
 
-# Small helper so we don't crash on weird values
-def _clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
+# Small, safe theme tweaks
+PRIMARY = "#2E86DE"
+BAD = "#C0392B"
+GOOD = "#1E8449"
 
 
-@dataclass
-class Settings:
-    # core
-    period: str
-    rsi_range: Tuple[int, int]
-    price_vs_ma50: str
-    price_vs_ma200: str
-    require_cross: bool
-    cross_type: str
-    cross_lookback: int
+# A small, static S&P 500 fallback set.
+# We keep the list short to minimize yfinance throttling in free tier;
+# the live function below tries to fetch the full list when available.
+SP500_FALLBACK = [
+    "AAPL", "MSFT", "AMZN", "GOOGL", "META",
+    "NVDA", "BRK-B", "UNH", "XOM", "JNJ",
+    "JPM", "V", "PG", "HD", "MA", "LLY", "MRK",
+    "AVGO", "PEP", "ABBV", "KO", "COST", "PFE",
+    "MCD", "ADBE", "CSCO", "TMO", "DHR",
+]
 
-    # macd
-    macd_enable: bool
-    macd_condition: str
-    macd_lookback: int
-
-    # fundamentals
-    fundamentals_enable: bool
-    mc_min: float
-    mc_max: float
-    pe_max: float
-    dy_min: float
-    beta_max: float
-
-    # scoring
-    scoring_enable: bool
-    w_rsi: float
-    w_trend: float
-    w_macd: float
-    w_cross: float
-
-    # output
-    top_n: int
-    universe: str
+PERIOD_OPTIONS = {
+    "6 months": "6mo",
+    "1 year": "1y",
+    "2 years": "2y",
+    "5 years": "5y",
+}
 
 
 # -----------------------------
-# Data sources
+# ----- Data acquisition ------
 # -----------------------------
 
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def get_sp500_tickers() -> List[str]:
     """
-    Pull a clean list of S&P 500 tickers from a CSV (no lxml required).
-    Fallback to a short static list if the request fails.
+    Try to fetch S&P 500 tickers. If pandas.read_html/lxml is not available
+    (common on free environments), fall back to a compact static list.
     """
-    urls = [
-        # official datasets repo
-        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
-        # alternate maintained CSV
-        "https://raw.githubusercontent.com/danielgrijalva/stock-indexes/master/indexes/sp500/constituents.csv",
-    ]
-    for url in urls:
-        try:
-            df = pd.read_csv(url)
-            col = "Symbol" if "Symbol" in df.columns else "symbol"
-            tickers = sorted(set(df[col].str.upper().str.replace(".", "-", regex=False)))
-            if tickers:
-                return tickers
-        except Exception:
-            continue
-
-    # short fallback if web is blocked
-    return [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META",
-        "BRK-B", "UNH", "XOM", "JPM", "V", "MA", "AVGO"
-    ]
+    try:
+        # The table on Wikipedia is often available but needs lxml.
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            flavor=None  # let pandas auto-select parser if available
+        )
+        df = tables[0]
+        # Some tickers contain dots (e.g., BRK.B). yfinance expects hyphen.
+        tickers = (
+            df["Symbol"]
+            .astype(str)
+            .str.replace(".", "-", regex=False)
+            .tolist()
+        )
+        # Keep it to a reasonable size to avoid throttling
+        if len(tickers) > 200:
+            tickers = tickers[:200]
+        return tickers
+    except Exception:
+        return SP500_FALLBACK
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def download_prices(tickers: List[str], period: str) -> pd.DataFrame:
     """
     Download daily prices for multiple tickers.
-    Returns a wide DataFrame of Adjusted Close with Date index.
+    Returns a wide DataFrame of Adjusted Close (or Close) with Date index.
+    Robust to the MultiIndex structure returned by yfinance.
     """
     data = yf.download(
         tickers=tickers,
@@ -115,17 +101,37 @@ def download_prices(tickers: List[str], period: str) -> pd.DataFrame:
         progress=False,
     )
 
-    # yfinance structure differs for one vs many tickers
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    # Multi-ticker -> MultiIndex (top level=ticker, second level=field)
     if isinstance(data.columns, pd.MultiIndex):
-        if ("Adj Close" in data.columns.levels[0]):
-            close = data["Adj Close"].copy()
-        else:
-            close = data["Close"].copy()
+        # Determine which level contains "Adj Close"/"Close"
+        field_level = None
+        for lvl in range(data.columns.nlevels):
+            values = data.columns.get_level_values(lvl).unique().tolist()
+            if ("Adj Close" in values) or ("Close" in values):
+                field_level = lvl
+                break
+        if field_level is None:
+            return pd.DataFrame()
+
+        fields = data.columns.get_level_values(field_level).unique().tolist()
+        target = "Adj Close" if "Adj Close" in fields else "Close"
+
+        # Take a cross-section at the field level -> columns become tickers
+        close = data.xs(target, axis=1, level=field_level)
+
+        # Keep tickers in the original order, dropping missing ones
+        existing = [t for t in tickers if t in close.columns]
+        close = close[existing]
+
     else:
-        # single ticker
+        # Single ticker case
         key = "Adj Close" if "Adj Close" in data.columns else "Close"
         close = data[[key]].copy()
-        close.columns = [tickers[0]]
+        t = tickers[0] if tickers else "TICKER"
+        close.columns = [t]
 
     close = close.sort_index()
     close = close.dropna(how="all")
@@ -133,542 +139,565 @@ def download_prices(tickers: List[str], period: str) -> pd.DataFrame:
 
 
 # -----------------------------
-# Technical indicators
+# ------ TA Calculations ------
 # -----------------------------
 
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False, min_periods=span).mean()
-
-
-def rsi_14(series: pd.Series, window: int = 14) -> pd.Series:
+def rsi_wilder(series: pd.Series, length: int = 14) -> pd.Series:
+    """
+    Wilder's RSI implementation; returns float series between 0..100.
+    """
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/window, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/window, adjust=False).mean()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+
+    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+
     rs = roll_up / roll_down.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return rsi.fillna(50.0)
 
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    macd_line = ema(series, fast) - ema(series, slow)
+def moving_average(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window=window, min_periods=window).mean()
+
+
+def macd_calc(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
 
-def crosses_up(a: pd.Series, b: pd.Series) -> pd.Series:
-    return (a > b) & (a.shift(1) <= b.shift(1))
-
-
-def crosses_down(a: pd.Series, b: pd.Series) -> pd.Series:
-    return (a < b) & (a.shift(1) >= b.shift(1))
+def recent_cross(up: pd.Series, down: pd.Series, lookback: int) -> Tuple[pd.Series, pd.Series]:
+    """
+    Returns a tuple (golden_cross_recent, death_cross_recent), boolean series.
+    Golden cross: up crosses above down.
+    Death cross: up crosses below down.
+    """
+    cross_up = (up > down) & (up.shift(1) <= down.shift(1))
+    cross_down = (up < down) & (up.shift(1) >= down.shift(1))
+    gc_recent = cross_up.rolling(lookback, min_periods=1).max().astype(bool)
+    dc_recent = cross_down.rolling(lookback, min_periods=1).max().astype(bool)
+    return gc_recent, dc_recent
 
 
 # -----------------------------
-# Fundamentals (optional)
+# ---- Compute Indicators -----
 # -----------------------------
 
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
-def fetch_fundamentals(tickers: List[str]) -> pd.DataFrame:
+def compute_indicators(close: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     """
-    Lightweight fundamentals using yfinance fast_info/info.
-    Returns columns: market_cap_b, pe, div_yield_pct, beta
+    Given wide Adjusted Close prices, compute indicators per ticker.
+    Returns dict of DataFrames, each DataFrame is wide (Date index, columns=tickers).
     """
-    recs = []
-    # Use yfinance Tickers for a bit of batching
-    yft = yf.Tickers(" ".join(tickers))
-    for tkr in tickers:
-        try:
-            tk = yft.tickers[tkr]
-            mc = np.nan
-            pe = np.nan
-            dy = np.nan
-            beta = np.nan
+    ma50 = close.apply(lambda s: moving_average(s, 50))
+    ma200 = close.apply(lambda s: moving_average(s, 200))
+    rsi14 = close.apply(lambda s: rsi_wilder(s, 14))
+    macd_line = pd.DataFrame(index=close.index)
+    signal_line = pd.DataFrame(index=close.index)
+    hist = pd.DataFrame(index=close.index)
+    for c in close.columns:
+        m, sig, h = macd_calc(close[c])
+        macd_line[c] = m
+        signal_line[c] = sig
+        hist[c] = h
 
-            # Try fast_info first
-            fi = getattr(tk, "fast_info", None) or {}
-            mc = fi.get("market_cap", np.nan)
-            dy = fi.get("dividend_yield", dy)
-            beta = fi.get("beta", beta)
+    gc_recent = pd.DataFrame(index=close.index)
+    dc_recent = pd.DataFrame(index=close.index)
+    for c in close.columns:
+        gc, dc = recent_cross(ma50[c], ma200[c], lookback=20)
+        gc_recent[c] = gc
+        dc_recent[c] = dc
 
-            # Fallback to info for PE/div if needed
-            inf = getattr(tk, "info", {}) or {}
-            if (isinstance(pe, float) and math.isnan(pe)) and "trailingPE" in inf:
-                pe = inf.get("trailingPE")
-            if (isinstance(dy, float) and math.isnan(dy)) and "dividendYield" in inf:
-                dy = inf.get("dividendYield")
-            if (isinstance(beta, float) and math.isnan(beta)) and "beta" in inf:
-                beta = inf.get("beta")
-
-            recs.append(
-                dict(
-                    Ticker=tkr,
-                    market_cap_b=(mc / 1e9) if pd.notna(mc) else np.nan,
-                    pe=pe if pd.notna(pe) else np.nan,
-                    div_yield_pct=(dy * 100.0 if pd.notna(dy) and dy < 1e3 else np.nan),
-                    beta=beta if pd.notna(beta) else np.nan,
-                )
-            )
-        except Exception:
-            recs.append(dict(Ticker=tkr, market_cap_b=np.nan, pe=np.nan, div_yield_pct=np.nan, beta=np.nan))
-    return pd.DataFrame.from_records(recs)
-
-
-# -----------------------------
-# Scanner core
-# -----------------------------
-
-def compute_snapshot(close: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute final snapshot row (latest value) for price, RSI, MA50, MA200, MACD.
-    """
-    ma50 = close.rolling(50).mean()
-    ma200 = close.rolling(200).mean()
-
-    # RSI per column
-    rsi_last = {}
-    for col in close.columns:
-        rsi_last[col] = rsi_14(close[col]).iloc[-1]
-    rsi_last = pd.Series(rsi_last)
-
-    # MACD last
-    macd_line_last, signal_last, hist_last = {}, {}, {}
-    for col in close.columns:
-        ml, sl, h = macd(close[col])
-        macd_line_last[col] = ml.iloc[-1]
-        signal_last[col] = sl.iloc[-1]
-        hist_last[col] = h.iloc[-1]
-
-    # Golden / Death crosses in trailing 60 sessions (we'll evaluate later by lookback)
-    gcross, dcross = {}, {}
-    for col in close.columns:
-        gc_series = crosses_up(ma50[col], ma200[col])
-        dc_series = crosses_down(ma50[col], ma200[col])
-        gcross[col] = gc_series
-        dcross[col] = dc_series
-    # store series dicts for later lookback checks
-    st.session_state["_gc"] = gcross
-    st.session_state["_dc"] = dcross
-
-    snap = pd.DataFrame({
-        "Price": close.iloc[-1],
-        "RSI14": rsi_last,
-        "MA50": ma50.iloc[-1],
-        "MA200": ma200.iloc[-1],
-        "MACD": pd.Series(macd_line_last),
-        "Signal": pd.Series(signal_last),
-        "Hist": pd.Series(hist_last),
-    })
-    snap.index.name = "Ticker"
-    snap = snap.dropna(subset=["Price", "MA50", "MA200"], how="any")
-    return snap
-
-
-def apply_filters(snap: pd.DataFrame, settings: Settings) -> pd.DataFrame:
-    low, high = settings.rsi_range
-    df = snap.copy()
-
-    # RSI band
-    df = df[(df["RSI14"] >= low) & (df["RSI14"] <= high)]
-
-    # price vs MAs
-    if settings.price_vs_ma50 == "Above":
-        df = df[df["Price"] > df["MA50"]]
-    elif settings.price_vs_ma50 == "Below":
-        df = df[df["Price"] < df["MA50"]]
-
-    if settings.price_vs_ma200 == "Above":
-        df = df[df["Price"] > df["MA200"]]
-    elif settings.price_vs_ma200 == "Below":
-        df = df[df["Price"] < df["MA200"]]
-
-    # recent MA crossover
-    if settings.require_cross:
-        look = int(settings.cross_lookback)
-        mask = []
-        gc_map = st.session_state.get("_gc", {})
-        dc_map = st.session_state.get("_dc", {})
-        for tkr in df.index:
-            gc = bool(gc_map.get(tkr, pd.Series(dtype=bool)).tail(look).any())
-            dc = bool(dc_map.get(tkr, pd.Series(dtype=bool)).tail(look).any())
-            if settings.cross_type == "Golden":
-                mask.append(gc)
-            elif settings.cross_type == "Death":
-                mask.append(dc)
-            else:
-                mask.append(gc or dc)
-        df = df[np.array(mask, dtype=bool)]
-
-    # MACD filter
-    if settings.macd_enable:
-        look = int(settings.macd_lookback)
-        # quick re-eval using last N sessions to confirm cross if needed
-        # We kept only last value in snap, so for "crossed" we approximate
-        # using MACD and signal slopes over last few days via download again is too heavy.
-        # Simple rule: last value relative to signal or sign(historical mean)
-        if settings.macd_condition == "Line > Signal":
-            df = df[df["MACD"] > df["Signal"]]
-        elif settings.macd_condition == "Line < Signal":
-            df = df[df["MACD"] < df["Signal"]]
-        elif settings.macd_condition == "Crossed up":
-            # MACD just crossed above signal recently:
-            # approximate: today MACD>Signal AND yesterday MACD<=Signal
-            # For speed we skip; we’ll accept "Line>Signal" as proxy.
-            df = df[df["MACD"] > df["Signal"]]
-        elif settings.macd_condition == "Crossed down":
-            df = df[df["MACD"] < df["Signal"]]
-        # "Any" -> no filter
-
-    return df
-
-
-def score_and_rank(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
-    if not settings.scoring_enable or df.empty:
-        df["Score"] = 0.0
-        return df
-
-    low, high = settings.rsi_range
-    center = (low + high) / 2.0
-    half = max(1.0, (high - low) / 2.0)
-    # RSI sweet spot (1.0 at center, decays to 0 at band edges)
-    rsi_score = 1 - np.minimum(1.0, np.abs(df["RSI14"] - center) / half)
-
-    # Trend vs MAs: 1.0 if above both, else partial credit
-    trend_score = 0.5 * (df["Price"] / df["MA50"]) + 0.5 * (df["Price"] / df["MA200"])
-    # normalize roughly around 1.0
-    trend_score = np.tanh(trend_score - 1.0) + 1.0  # ~0..2 -> squash to ~0..1.76, then scale:
-    trend_score = (trend_score - trend_score.min()) / (trend_score.max() - trend_score.min() + 1e-9)
-
-    # MACD momentum: positive hist is good
-    macd_mom = np.tanh(df["Hist"].fillna(0.0))
-    macd_mom = (macd_mom - macd_mom.min()) / (macd_mom.max() - macd_mom.min() + 1e-9)
-
-    # Cross bonus (if present in trailing lookback)
-    cross_bonus = np.zeros(len(df))
-    if settings.require_cross:
-        gc_map = st.session_state.get("_gc", {})
-        dc_map = st.session_state.get("_dc", {})
-        look = int(settings.cross_lookback)
-        for i, tkr in enumerate(df.index):
-            gc = bool(gc_map.get(tkr, pd.Series(dtype=bool)).tail(look).any())
-            dc = bool(dc_map.get(tkr, pd.Series(dtype=bool)).tail(look).any())
-            if settings.cross_type == "Golden":
-                cross_bonus[i] = 1.0 if gc else 0.0
-            elif settings.cross_type == "Death":
-                cross_bonus[i] = 1.0 if dc else 0.0
-            else:
-                cross_bonus[i] = 1.0 if (gc or dc) else 0.0
-
-    score = (
-        settings.w_rsi * rsi_score +
-        settings.w_trend * trend_score +
-        settings.w_macd * macd_mom +
-        settings.w_cross * cross_bonus
+    return dict(
+        close=close,
+        ma50=ma50,
+        ma200=ma200,
+        rsi14=rsi14,
+        macd=macd_line,
+        macd_signal=signal_line,
+        macd_hist=hist,
+        gc_recent=gc_recent,
+        dc_recent=dc_recent,
     )
 
-    df = df.copy()
-    df["Score"] = score
-    return df.sort_values("Score", ascending=False)
+
+# -----------------------------
+# ---------- Filters ----------
+# -----------------------------
+
+@dataclass
+class Settings:
+    universe: List[str]
+    period: str
+    rsi_min: float
+    rsi_max: float
+    price_vs_ma50: str  # Any / Above / Below
+    price_vs_ma200: str
+    require_recent_cross: bool
+    cross_type: str      # Golden / Death
+    cross_lookback: int
+
+    macd_enable: bool
+    macd_condition: str  # Line > Signal / Line < Signal / Bull cross / Bear cross
+    macd_lookback: int
+
+    fundamentals_enable: bool
+    mcap_min: Optional[float]
+    mcap_max: Optional[float]
+
+    # ranking
+    ranking_enable: bool
+    weight_rsi: float
+    weight_trend: float
+    weight_macd: float
+    weight_cross: float
+    top_n: int
 
 
-def apply_fundamentals(df: pd.DataFrame, settings: Settings) -> pd.DataFrame:
-    if not settings.fundamentals_enable or df.empty:
-        return df
-
-    fundamentals = fetch_fundamentals(df.index.tolist())
-    merged = df.merge(fundamentals, left_index=True, right_on="Ticker", how="left").set_index("Ticker", drop=True)
-
-    # filters
-    if not math.isinf(settings.mc_min) or not math.isinf(settings.mc_max):
-        merged = merged[(merged["market_cap_b"] >= settings.mc_min) & (merged["market_cap_b"] <= settings.mc_max)]
-    merged = merged[(merged["pe"].isna()) | (merged["pe"] <= settings.pe_max)]
-    merged = merged[(merged["div_yield_pct"].isna()) | (merged["div_yield_pct"] >= settings.dy_min)]
-    merged = merged[(merged["beta"].isna()) | (merged["beta"] <= settings.beta_max)]
-
-    return merged
+def pass_price_vs_ma(relation: str, price: float, ma: float) -> bool:
+    if np.isnan(price) or np.isnan(ma):
+        return False
+    if relation == "Any":
+        return True
+    if relation == "Above":
+        return price >= ma
+    if relation == "Below":
+        return price <= ma
+    return True
 
 
-def run_scan_once(settings: Settings, universe: List[str]) -> pd.DataFrame:
-    with st.spinner("Downloading prices and computing indicators…"):
-        close = download_prices(universe, settings.period)
-        if close.empty:
-            return pd.DataFrame()
-        snap = compute_snapshot(close)
-        # keep price table for reuse in charts (optional)
-        st.session_state["_last_close"] = close
+def macd_filter(cond: str,
+                macd_line: float,
+                signal_line: float,
+                hist_series: pd.Series,
+                lookback: int) -> bool:
+    if np.isnan(macd_line) or np.isnan(signal_line):
+        return False
+    if cond == "Line > Signal":
+        return macd_line > signal_line
+    if cond == "Line < Signal":
+        return macd_line < signal_line
+    if cond == "Bull cross (last N days)":
+        # Hist turns positive
+        return (hist_series.tail(lookback) > 0).any() and (hist_series.shift(1).tail(lookback) <= 0).any()
+    if cond == "Bear cross (last N days)":
+        return (hist_series.tail(lookback) < 0).any() and (hist_series.shift(1).tail(lookback) >= 0).any()
+    return True
 
-    # technical filters
-    filtered = apply_filters(snap, settings)
 
-    # fundamentals (optional)
-    filtered = apply_fundamentals(filtered, settings)
-
-    # scoring/ranking
-    ranked = score_and_rank(filtered, settings)
-
-    # final tidy columns/format
-    out = ranked[["Score", "Price", "RSI14", "MA50", "MA200", "MACD", "Signal", "Hist"]].copy()
-    out = out.sort_values("Score", ascending=False)
-    return out
+def fundamentals_gate(enabled: bool, ticker: str, min_cap: Optional[float], max_cap: Optional[float]) -> bool:
+    if not enabled:
+        return True
+    try:
+        info = yf.Ticker(ticker).fast_info  # fast_info is cheaper than .info
+        mcap = float(info.get("market_cap") or np.nan)
+        if np.isnan(mcap):
+            return False
+        if min_cap is not None and mcap < min_cap:
+            return False
+        if max_cap is not None and mcap > max_cap:
+            return False
+        return True
+    except Exception:
+        # If we cannot fetch, be conservative and exclude
+        return False
 
 
 # -----------------------------
-# Charting
+# --------- Scoring -----------
 # -----------------------------
 
-@st.cache_data(show_spinner=False, ttl=3 * 3600)
-def get_history_for_chart(ticker: str, period: str) -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False)
-    df = df.rename(columns=lambda c: c.title())
-    return df
+def score_one(
+    tkr: str,
+    idx: int,
+    ind: Dict[str, pd.DataFrame],
+    cfg: Settings,
+) -> Optional[Dict]:
+    """
+    Returns dict with fields or None if it fails any filter.
+    """
+    close = ind["close"][tkr].iloc[: idx + 1]
+    ma50 = ind["ma50"][tkr].iloc[: idx + 1]
+    ma200 = ind["ma200"][tkr].iloc[: idx + 1]
+    rsi = ind["rsi14"][tkr].iloc[: idx + 1]
+    macd_line = ind["macd"][tkr].iloc[: idx + 1]
+    macd_sig = ind["macd_signal"][tkr].iloc[: idx + 1]
+    hist = ind["macd_hist"][tkr].iloc[: idx + 1]
+    gc_recent = ind["gc_recent"][tkr].iloc[: idx + 1]
+    dc_recent = ind["dc_recent"][tkr].iloc[: idx + 1]
+
+    if close.empty:
+        return None
+
+    last_p = float(close.iloc[-1])
+    last_rsi = float(rsi.iloc[-1])
+    last_ma50 = float(ma50.iloc[-1]) if not np.isnan(ma50.iloc[-1]) else np.nan
+    last_ma200 = float(ma200.iloc[-1]) if not np.isnan(ma200.iloc[-1]) else np.nan
+    last_macd = float(macd_line.iloc[-1])
+    last_sig = float(macd_sig.iloc[-1])
+
+    # RSI range
+    if not (cfg.rsi_min <= last_rsi <= cfg.rsi_max):
+        return None
+
+    # Price vs MAs
+    if not pass_price_vs_ma(cfg.price_vs_ma50, last_p, last_ma50):
+        return None
+    if not pass_price_vs_ma(cfg.price_vs_ma200, last_p, last_ma200):
+        return None
+
+    # Recent cross
+    if cfg.require_recent_cross:
+        look = cfg.cross_lookback
+        if cfg.cross_type == "Golden":
+            if not bool(gc_recent.tail(look).any()):
+                return None
+        else:
+            if not bool(dc_recent.tail(look).any()):
+                return None
+
+    # MACD filter
+    if cfg.macd_enable:
+        if not macd_filter(cfg.macd_condition, last_macd, last_sig, hist, cfg.macd_lookback):
+            return None
+
+    # Fundamentals
+    if not fundamentals_gate(cfg.fundamentals_enable, tkr, cfg.mcap_min, cfg.mcap_max):
+        return None
+
+    # ---------- scoring ----------
+    score = 0.0
+    weights = 0.0
+
+    if cfg.ranking_enable:
+        # (1) RSI sweet spot (~50-60) -> score uses Gaussian centered at 55
+        w = cfg.weight_rsi
+        comp = math.exp(-((last_rsi - 55.0) ** 2) / (2 * 12.0 ** 2))
+        score += w * comp
+        weights += w
+
+        # (2) Trend vs MAs: higher if price above both and MA50 > MA200
+        w = cfg.weight_trend
+        trend = 0.0
+        if not np.isnan(last_ma50) and not np.isnan(last_ma200):
+            trend += 0.5 if last_p >= last_ma50 else -0.2
+            trend += 0.5 if last_p >= last_ma200 else -0.2
+            trend += 0.5 if last_ma50 >= last_ma200 else -0.5
+        score += w * (trend / 1.5)  # normalize roughly between -1..1
+        weights += w
+
+        # (3) MACD momentum: histogram z-score-ish
+        w = cfg.weight_macd
+        h_tail = hist.tail(20).dropna()
+        macd_mom = float(h_tail.mean()) if not h_tail.empty else 0.0
+        score += w * (1 / (1 + math.exp(-5 * macd_mom)))  # squashed 0..1
+        weights += w
+
+        # (4) Golden cross recency bonus
+        w = cfg.weight_cross
+        cross_bonus = 1.0 if bool(gc_recent.tail(60).any()) else 0.0
+        score += w * cross_bonus
+        weights += w
+
+    final = score / weights if weights > 0 else 0.0
+
+    return dict(
+        Ticker=tkr,
+        Price=last_p,
+        RSI14=last_rsi,
+        MA50=last_ma50,
+        MA200=last_ma200,
+        MACD=last_macd,
+        MACDSignal=last_sig,
+        Score=final,
+    )
 
 
-def plot_ticker_chart(ticker: str, period: str = "1y"):
-    df = get_history_for_chart(ticker, period)
-    if df.empty:
-        st.info("No OHLCV data for this ticker / period.")
-        return
+def run_scan_once(cfg: Settings) -> pd.DataFrame:
+    tickers = cfg.universe
+    close = download_prices(tickers, cfg.period)
+    if close.empty:
+        return pd.DataFrame()
 
-    close = df["Adj Close"] if "Adj Close" in df.columns else df["Close"]
-    ma50 = close.rolling(50).mean()
-    ma200 = close.rolling(200).mean()
+    ind = compute_indicators(close)
+    idx_last = len(ind["close"].index) - 1
+    if idx_last < 0:
+        return pd.DataFrame()
 
-    rsi = rsi_14(close)
-    macd_line, signal_line, hist = macd(close)
+    rows = []
+    for t in close.columns:
+        res = score_one(t, idx_last, ind, cfg)
+        if res:
+            rows.append(res)
 
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if cfg.ranking_enable:
+        df = df.sort_values("Score", ascending=False)
+        df.insert(0, "Rank", range(1, len(df) + 1))
+    else:
+        df = df.sort_values("Ticker")
+    return df.reset_index(drop=True)
+
+
+# -----------------------------
+# --------- Charting ----------
+# -----------------------------
+
+def plot_interactive(
+    tkr: str,
+    ind: Dict[str, pd.DataFrame],
+) -> go.Figure:
+    close = ind["close"][tkr]
+    ma50 = ind["ma50"][tkr]
+    ma200 = ind["ma200"][tkr]
+    rsi = ind["rsi14"][tkr]
+    macd_line = ind["macd"][tkr]
+    macd_sig = ind["macd_signal"][tkr]
+    hist = ind["macd_hist"][tkr]
+
+    fig = make_price_rsi_macd(close, ma50, ma200, rsi, macd_line, macd_sig, hist, title=f"{tkr} — Interactive")
+
+    return fig
+
+
+def make_price_rsi_macd(
+    close: pd.Series,
+    ma50: pd.Series,
+    ma200: pd.Series,
+    rsi: pd.Series,
+    macd_line: pd.Series,
+    macd_sig: pd.Series,
+    hist: pd.Series,
+    title: str = "Interactive Chart",
+) -> go.Figure:
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
-        row_heights=[0.55, 0.22, 0.23],
-        specs=[[{"secondary_y": True}], [{}], [{}]]
+        vertical_spacing=0.03,
+        row_heights=[0.55, 0.2, 0.25],
+        subplot_titles=("Price", "RSI (14)", "MACD")
     )
 
     # Price + MAs
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price", showlegend=True
-    ), row=1, col=1, secondary_y=False)
-
-    fig.add_trace(go.Scatter(x=df.index, y=ma50, name="MA50", line=dict(color="#63B3ED")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ma200, name="MA200", line=dict(color="#F56565")), row=1, col=1)
-
-    # Volume
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color="#90cdf4", opacity=0.5),
-                  row=1, col=1, secondary_y=True)
+    fig.add_trace(go.Scatter(x=close.index, y=close, name="Adj Close", line=dict(color=PRIMARY, width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ma50.index, y=ma50, name="MA50", line=dict(color="#6ab04c")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ma200.index, y=ma200, name="MA200", line=dict(color="#e74c3c")), row=1, col=1)
 
     # RSI
-    fig.add_trace(go.Scatter(x=df.index, y=rsi, name="RSI(14)", line=dict(color="#4A5568")), row=2, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="#E53E3E", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="#38A169", row=2, col=1)
+    fig.add_trace(go.Scatter(x=rsi.index, y=rsi, name="RSI(14)", line=dict(color="#7f8c8d")), row=2, col=1)
+    fig.add_hline(y=70, line=dict(color=BAD, width=1, dash="dot"), row=2, col=1)
+    fig.add_hline(y=30, line=dict(color=GOOD, width=1, dash="dot"), row=2, col=1)
 
     # MACD
-    colors = np.where(hist >= 0, "#48BB78", "#E53E3E")
-    fig.add_trace(go.Bar(x=df.index, y=hist, name="Hist", marker_color=colors, opacity=0.7), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=macd_line, name="MACD", line=dict(color="#805AD5")), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=signal_line, name="Signal", line=dict(color="#ED8936")), row=3, col=1)
-
-    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="RSI(14)", row=2, col=1, range=[0, 100])
-    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    fig.add_trace(go.Scatter(x=macd_line.index, y=macd_line, name="MACD", line=dict(color="#8e44ad")), row=3, col=1)
+    fig.add_trace(go.Scatter(x=macd_sig.index, y=macd_sig, name="Signal", line=dict(color="#f39c12")), row=3, col=1)
+    fig.add_trace(go.Bar(x=hist.index, y=hist, name="Hist",
+                         marker_color=np.where(hist >= 0, "#27ae60", "#c0392b"),
+                         opacity=0.6), row=3, col=1)
 
     fig.update_layout(
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=720,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        xaxis_rangeslider_visible=False,
+        title=title,
+        height=760,
+        showlegend=True,
+        margin=dict(t=40, r=10, l=10, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    return fig
+
+
+# Helper because Plotly subplots are used above
+from plotly.subplots import make_subplots
 
 
 # -----------------------------
-# Sidebar filters (with safe defaults)
+# ------------ UI -------------
 # -----------------------------
 
 def render_filters() -> Settings:
-    with st.sidebar:
-        st.header("Filters")
+    st.sidebar.title("Filters")
 
-        with st.form("filters_form", clear_on_submit=False):
-            period = st.selectbox(
-                "Price history period",
-                ["6mo", "1y", "2y", "5y", "10y", "max"],
-                index=1,
-            )
-            rsi_range = st.slider("RSI Range (14)", 0, 100, (30, 70))
+    # Universe
+    with st.sidebar.expander("Universe", expanded=True):
+        universe_choice = st.radio(
+            "Stock universe",
+            ["S&P 500 (auto)", "Fallback sample (fast)"],
+            index=0,
+        )
+        if universe_choice == "S&P 500 (auto)":
+            universe = get_sp500_tickers()
+        else:
+            universe = SP500_FALLBACK
 
+        period_label = st.selectbox("Price history period", list(PERIOD_OPTIONS.keys()), index=1)
+        period = PERIOD_OPTIONS[period_label]
+
+    # Technical
+    with st.sidebar.expander("Technical filters", expanded=True):
+        rsi_min, rsi_max = st.slider("RSI Range (14)", 0, 100, (30, 70))
+
+        colA, colB = st.columns(2)
+        with colA:
             price_vs_ma50 = st.selectbox("Price vs 50-day MA", ["Any", "Above", "Below"], index=0)
+        with colB:
             price_vs_ma200 = st.selectbox("Price vs 200-day MA", ["Any", "Above", "Below"], index=0)
 
-            require_cross = st.checkbox("Require recent MA crossover (50 vs 200)?", value=False)
-            cross_type = st.selectbox("Crossover Type", ["Golden", "Death", "Any"], index=0, disabled=not require_cross)
-            cross_lookback = st.number_input(
-                "Lookback days for crossover", min_value=1, max_value=60, value=10, step=1, disabled=not require_cross
+        req_cross = st.checkbox("Require recent MA crossover (50 vs 200)?", value=False)
+        cross_type = "Golden"
+        look_cross = 10
+        if req_cross:
+            col1, col2 = st.columns(2)
+            with col1:
+                cross_type = st.selectbox("Crossover type", ["Golden", "Death"], index=0)
+            with col2:
+                look_cross = st.number_input("Lookback days", min_value=1, max_value=60, value=10, step=1)
+
+    # MACD
+    with st.sidebar.expander("MACD filter", expanded=False):
+        macd_enable = st.checkbox("Enable MACD filter", value=False)
+        macd_cond = "Line > Signal"
+        macd_look = 10
+        if macd_enable:
+            macd_cond = st.selectbox(
+                "Condition",
+                ["Line > Signal", "Line < Signal", "Bull cross (last N days)", "Bear cross (last N days)"],
+                index=0
             )
+            macd_look = st.number_input("Lookback days for cross", 1, 60, 10, 1)
 
-            st.markdown("---")
-            st.subheader("MACD")
-            macd_enable = st.checkbox("Enable MACD filter", value=False)
-            macd_condition = st.selectbox(
-                "MACD condition",
-                ["Line > Signal", "Line < Signal", "Crossed up", "Crossed down", "Any"],
-                index=0,
-                disabled=not macd_enable,
-            )
-            macd_lookback = st.number_input(
-                "Lookback days for MACD cross", min_value=1, max_value=60, value=10, step=1, disabled=not macd_enable
-            )
+    # Fundamentals (only rendered if enabled to avoid ValueAboveMax errors)
+    with st.sidebar.expander("Fundamentals (optional)", expanded=False):
+        fundamentals_enable = st.checkbox("Enable fundamentals filters", value=False, help="Simple market-cap bounds.")
+        min_cap = None
+        max_cap = None
+        if fundamentals_enable:
+            min_cap = st.number_input("Market cap min ($)", value=0.0, min_value=0.0, step=1_000_000_000.0, format="%.2f")
+            max_cap = st.number_input("Market cap max ($)", value=0.0, min_value=0.0, step=1_000_000_000.0, format="%.2f")
+            if max_cap == 0.0:
+                max_cap = None
 
-            st.markdown("---")
-            st.subheader("Fundamental Filters")
-            fundamentals_enable = st.checkbox("Enable fundamental filters", value=False)
+    # Ranking & weights
+    with st.sidebar.expander("Scoring & ranking", expanded=True):
+        ranking_enable = st.checkbox("Enable ranking / composite score", value=True)
+        weight_rsi = 1.0
+        weight_trend = 1.0
+        weight_macd = 1.0
+        weight_cross = 0.5
+        if ranking_enable:
+            weight_rsi = st.slider("Weight: RSI sweet spot", 0.0, 2.0, 1.0, 0.05)
+            weight_trend = st.slider("Weight: Trend vs MAs", 0.0, 2.0, 1.0, 0.05)
+            weight_macd = st.slider("Weight: MACD momentum", 0.0, 2.0, 1.0, 0.05)
+            weight_cross = st.slider("Weight: Golden/Death cross", 0.0, 2.0, 0.5, 0.05)
 
-            # persisted defaults & clamped values
-            mc_min_default = _clamp(float(st.session_state.get("mc_min", 0.0)), 0.0, 10000.0)
-            mc_max_default = _clamp(float(st.session_state.get("mc_max", 5000.0)), 0.0, 10000.0)
-            pe_max_default = _clamp(float(st.session_state.get("pe_max", 100.0)), 0.0, 1000.0)
-            dy_min_default = _clamp(float(st.session_state.get("dy_min", 0.0)), 0.0, 50.0)
-            beta_max_default = _clamp(float(st.session_state.get("beta_max", 3.0)), 0.0, 10.0)
-
-            mc_min = st.number_input(
-                "Market Cap min ($B)", min_value=0.0, max_value=10000.0,
-                value=mc_min_default, step=10.0, disabled=not fundamentals_enable
-            )
-            mc_max = st.number_input(
-                "Market Cap max ($B)", min_value=0.0, max_value=10000.0,
-                value=mc_max_default, step=10.0, disabled=not fundamentals_enable
-            )
-            pe_max = st.number_input(
-                "P/E max", min_value=0.0, max_value=1000.0,
-                value=pe_max_default, step=1.0, disabled=not fundamentals_enable
-            )
-            dy_min = st.number_input(
-                "Dividend Yield min (%)", min_value=0.0, max_value=50.0,
-                value=dy_min_default, step=0.1, disabled=not fundamentals_enable
-            )
-            beta_max = st.number_input(
-                "Beta max (5y monthly)", min_value=0.0, max_value=10.0,
-                value=beta_max_default, step=0.1, disabled=not fundamentals_enable
-            )
-
-            # persist
-            st.session_state["mc_min"] = mc_min
-            st.session_state["mc_max"] = mc_max
-            st.session_state["pe_max"] = pe_max
-            st.session_state["dy_min"] = dy_min
-            st.session_state["beta_max"] = beta_max
-
-            st.markdown("---")
-            st.subheader("Scoring & Ranking")
-            scoring_enable = st.checkbox("Enable ranking / composite score", value=True)
-            w_rsi = st.slider("Weight: RSI sweet spot", 0.0, 2.0, 1.0, 0.1, disabled=not scoring_enable)
-            w_trend = st.slider("Weight: Trend vs MAs", 0.0, 2.0, 1.0, 0.1, disabled=not scoring_enable)
-            w_macd = st.slider("Weight: MACD momentum", 0.0, 2.0, 1.0, 0.1, disabled=not scoring_enable)
-            w_cross = st.slider("Weight: Golden/Death boost", 0.0, 2.0, 0.5, 0.1, disabled=not scoring_enable)
-
-            top_n = st.number_input("Show Top N", min_value=5, max_value=100, value=25, step=1)
-
-            universe = st.selectbox("Universe", ["S&P 500"], index=0)
-
-            submitted = st.form_submit_button("Run Scan", use_container_width=True)
-
-    if submitted:
-        st.session_state["_run_scan"] = True
+        top_n = st.number_input("Show Top N", min_value=5, max_value=100, value=25, step=1)
 
     return Settings(
+        universe=universe,
         period=period,
-        rsi_range=rsi_range,
+        rsi_min=float(rsi_min),
+        rsi_max=float(rsi_max),
         price_vs_ma50=price_vs_ma50,
         price_vs_ma200=price_vs_ma200,
-        require_cross=require_cross,
+        require_recent_cross=req_cross,
         cross_type=cross_type,
-        cross_lookback=int(cross_lookback),
+        cross_lookback=int(look_cross),
         macd_enable=macd_enable,
-        macd_condition=macd_condition,
-        macd_lookback=int(macd_lookback),
+        macd_condition=macd_cond,
+        macd_lookback=int(macd_look),
         fundamentals_enable=fundamentals_enable,
-        mc_min=float(mc_min),
-        mc_max=float(mc_max),
-        pe_max=float(pe_max),
-        dy_min=float(dy_min),
-        beta_max=float(beta_max),
-        scoring_enable=scoring_enable,
-        w_rsi=float(w_rsi),
-        w_trend=float(w_trend),
-        w_macd=float(w_macd),
-        w_cross=float(w_cross),
+        mcap_min=float(min_cap) if fundamentals_enable else None,
+        mcap_max=float(max_cap) if (fundamentals_enable and max_cap is not None) else None,
+        ranking_enable=ranking_enable,
+        weight_rsi=float(weight_rsi),
+        weight_trend=float(weight_trend),
+        weight_macd=float(weight_macd),
+        weight_cross=float(weight_cross),
         top_n=int(top_n),
-        universe=universe,
     )
 
-
-# -----------------------------
-# Main UI
-# -----------------------------
 
 def main():
     st.title("StockPeers Screener")
 
-    settings = render_filters()
+    # --- Left: filters / Right: output ---
+    cfg = render_filters()
 
-    # Only re-run the compute pipeline when the user explicitly presses Run Scan
-    if st.session_state.get("_run_scan", False):
-        universe = get_sp500_tickers()
-        results = run_scan_once(settings, universe)
-        st.session_state["_results"] = results
-        st.session_state["_run_scan"] = False
+    # Use a form to avoid immediate reruns on every widget change.
+    with st.form("run_form", clear_on_submit=False):
+        submitted = st.form_submit_button("Run Scan", use_container_width=True)
 
-    results = st.session_state.get("_results")
+    # We always keep the latest settings in session state so chart selection won't wipe results
+    st.session_state.setdefault("latest_settings", cfg)
+    st.session_state["latest_settings"] = cfg
 
-    if results is None:
-        st.info("Set your filters in the sidebar and click **Run Scan** to get started.")
+    if submitted or ("results_df" not in st.session_state):
+        with st.spinner("Scanning..."):
+            df = run_scan_once(cfg)
+        st.session_state["results_df"] = df
+
+        # Also keep indicators & prices for charting (only for tickers that passed)
+        if not df.empty:
+            tickers = df["Ticker"].tolist()
+            close = download_prices(tickers, cfg.period)
+            st.session_state["indicators"] = compute_indicators(close)
+        else:
+            st.session_state["indicators"] = None
+
+    results_df: pd.DataFrame = st.session_state.get("results_df", pd.DataFrame())
+
+    if results_df.empty:
+        st.success("Found 0 match(es). Adjust filters and press **Run Scan**.")
         return
 
-    if results.empty:
-        st.success("Found 0 match(es).")
-        st.dataframe(pd.DataFrame(columns=["Ticker", "Score", "Price", "RSI14", "MA50", "MA200"]))
+    # Show top N
+    show_df = results_df.copy()
+    if cfg.top_n and len(show_df) > cfg.top_n:
+        show_df = show_df.head(cfg.top_n)
+
+    st.success(f"Found {len(results_df)} match(es). Showing top {min(cfg.top_n, len(results_df))}.")
+
+    # Nicely formatted table
+    fmt = show_df.copy()
+    if "Price" in fmt.columns:
+        fmt["Price"] = fmt["Price"].map(lambda x: f"${x:,.2f}")
+    for c in ["RSI14", "MA50", "MA200"]:
+        if c in fmt.columns:
+            fmt[c] = fmt[c].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
+    if "Score" in fmt.columns:
+        fmt["Score"] = fmt["Score"].map(lambda x: f"{x:0.3f}")
+
+    st.dataframe(fmt, use_container_width=True, hide_index=True)
+
+    # ------------- Chart -------------
+    st.subheader("Interactive Chart")
+
+    ind = st.session_state.get("indicators")
+    if ind is None:
+        st.info("No indicators computed (no matches).")
         return
 
-    st.success(f"Found {len(results)} match(es).")
+    tickers = show_df["Ticker"].tolist()
+    chart_tkr = st.selectbox("Choose ticker", tickers, key="chart_ticker")
+    fig = plot_interactive(chart_tkr, ind)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Top N & formatting
-    top = results.head(settings.top_n).copy()
-    top.reset_index(inplace=True)
-
-    st.dataframe(
-        top,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Ticker": st.column_config.TextColumn("Ticker"),
-            "Score": st.column_config.NumberColumn("Score", format="%.3f"),
-            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-            "RSI14": st.column_config.NumberColumn("RSI14", format="%.2f"),
-            "MA50": st.column_config.NumberColumn("MA50", format="%.2f"),
-            "MA200": st.column_config.NumberColumn("MA200", format="%.2f"),
-            "MACD": st.column_config.NumberColumn("MACD", format="%.3f"),
-            "Signal": st.column_config.NumberColumn("Signal", format="%.3f"),
-            "Hist": st.column_config.NumberColumn("Hist", format="%.3f"),
-        },
-    )
-
-    st.markdown("### Interactive Chart")
-
-    available = top["Ticker"].tolist()
-    if not available:
-        st.info("No tickers to chart. Adjust filters or Top N.")
-        return
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        ticker = st.selectbox("Choose ticker", available, index=0, key="chart_ticker")
-    with col2:
-        chart_period = st.selectbox("Chart period", ["6mo", "1y", "2y", "5y"], index=1)
-
-    plot_ticker_chart(ticker, period=chart_period)
+    # Optional debug (collapsed)
+    with st.expander("Debug (data sanity check)", expanded=False):
+        t = chart_tkr
+        close = ind["close"][t]
+        ma50 = ind["ma50"][t]
+        ma200 = ind["ma200"][t]
+        rsi = ind["rsi14"][t]
+        macd_line = ind["macd"][t]
+        macd_sig = ind["macd_signal"][t]
+        hist = ind["macd_hist"][t]
+        dbg = make_price_rsi_macd(close, ma50, ma200, rsi, macd_line, macd_sig, hist, title=f"{t} — Debug")
+        st.plotly_chart(dbg, use_container_width=True)
 
 
 if __name__ == "__main__":
